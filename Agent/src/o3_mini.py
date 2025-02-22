@@ -1,17 +1,14 @@
 """
 O3-mini model integration for deep thinking tasks.
 """
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, AsyncGenerator
 import logging
-import requests
+from openai import AsyncOpenAI
 import json
 
-from .config import O3_MINI_API_KEY
+from config import O3_MINI_API_KEY, O3_MINI_MODEL
 
 logger = logging.getLogger(__name__)
-
-# Replace with actual o3-mini endpoint URL if available
-O3_MINI_ENDPOINT = "https://api.o3-mini.example.com/v1/solve"
 
 class O3MiniAgent:
     def __init__(self):
@@ -20,9 +17,10 @@ class O3MiniAgent:
             logger.error("O3-mini API key not found. O3-mini functionality will not be available.")
             self.is_available = False
         else:
+            self.client = AsyncOpenAI(api_key=O3_MINI_API_KEY)
             self.is_available = True
 
-    async def process(self, user_input: str, context: Optional[Dict[str, Any]] = None) -> str:
+    async def process(self, user_input: str, context: Optional[Dict[str, Any]] = None) -> AsyncGenerator[str, None]:
         """
         Process user input using the O3-mini model.
         
@@ -31,7 +29,7 @@ class O3MiniAgent:
             context: Optional context dictionary
         
         Returns:
-            str: The model's response
+            AsyncGenerator[str, None]: The model's response chunks
         
         Raises:
             RuntimeError: If the O3-mini functionality is not available
@@ -44,13 +42,14 @@ class O3MiniAgent:
 
         try:
             # Use think_deep for processing
-            return await self.think_deep(self._prepare_prompt(user_input, context))
+            async for chunk in self.think_deep(self._prepare_prompt(user_input, context)):
+                yield chunk
 
         except Exception as e:
             logger.error(f"Error in O3-mini processing: {str(e)}")
             raise
 
-    async def think_deep(self, problem_prompt: str) -> str:
+    async def think_deep(self, problem_prompt: str) -> AsyncGenerator[str, None]:
         """
         Use o3-mini to think deeply about a complex problem.
         
@@ -63,36 +62,30 @@ class O3MiniAgent:
                                 deep analysis.
         
         Returns:
-            str: The computed result or analysis from o3-mini.
+            AsyncGenerator[str, None]: The computed result or analysis from o3-mini.
             
         Raises:
             RuntimeError: If the O3-mini functionality is not available
-            requests.RequestException: If there's an error communicating with the API
         """
         if not self.is_available:
             raise RuntimeError("O3-mini functionality is not available.")
 
-        payload = {
-            "prompt": problem_prompt,
-            "max_tokens": 700,  # Adjust as necessary
-            "temperature": 0.7,  # Balanced between creativity and focus
-            "stream": True  # Enable streaming for real-time responses
-        }
-        
-        headers = {
-            "Authorization": f"Bearer {O3_MINI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-
         try:
-            response = requests.post(O3_MINI_ENDPOINT, json=payload, headers=headers)
-            response.raise_for_status()
-            result = response.json()
+            stream = await self.client.chat.completions.create(
+                model=O3_MINI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an AI assistant specialized in deep analysis and complex reasoning."},
+                    {"role": "user", "content": problem_prompt}
+                ],
+                temperature=0.7,
+                stream=True
+            )
             
-            # Extract and clean the response
-            return self._clean_response(result.get("text", "No result returned"))
+            async for chunk in stream:
+                if chunk.choices[0].delta.content is not None:
+                    yield chunk.choices[0].delta.content
             
-        except requests.RequestException as e:
+        except Exception as e:
             logger.error(f"Error in O3-mini API call: {str(e)}")
             raise
 
@@ -111,25 +104,6 @@ class O3MiniAgent:
         
         if context and "history" in context:
             history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in context["history"]])
-            return f"{system_prompt}\n\nContext:\n{history}\n\nUser: {user_input}\nAssistant:"
+            return f"{system_prompt}\n\nContext:\n{history}\n\nUser: {user_input}"
         
-        return f"{system_prompt}\n\nUser: {user_input}\nAssistant:"
-
-    def _clean_response(self, response: str) -> str:
-        """
-        Clean the model's response by removing any artifacts.
-        
-        Args:
-            response: The raw model response
-        
-        Returns:
-            str: The cleaned response
-        """
-        # Remove any unwanted artifacts or formatting
-        response = response.strip()
-        
-        # Remove any system-specific markers
-        response = response.replace("Assistant:", "").strip()
-        response = response.replace("User:", "").strip()
-        
-        return response 
+        return f"{system_prompt}\n\nUser: {user_input}" 

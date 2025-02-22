@@ -60,7 +60,7 @@ except ValueError as e:
     print("Some functionality may be limited.")
 
 # Model Configuration
-GPT4_MODEL = "gpt-4-turbo-preview"
+GPT4_MODEL = "gpt-4o"
 O3_MINI_MODEL = "o3-mini"
 
 # Database Configuration

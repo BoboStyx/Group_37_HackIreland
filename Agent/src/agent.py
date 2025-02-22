@@ -3,12 +3,12 @@ Main AI agent implementation coordinating between different models and tasks.
 """
 from typing import Optional, Dict, Any, List
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from .chatgpt_agent import ChatGPTAgent
-from .o3_mini import O3MiniAgent
-from .database import SessionLocal, Conversation, AgentTask, Task, get_tasks_by_urgency, update_task_status
-from .config import (
+from chatgpt_agent import ChatGPTAgent
+from o3_mini import O3MiniAgent
+from database import SessionLocal, Conversation, AgentTask, Task, get_tasks_by_urgency, update_task_status
+from config import (
     MAX_RETRIES, TIMEOUT, MAX_TOKENS, MAX_EMAILS,
     URGENCY_ORDER, HALF_FINISHED_PRIORITY
 )
@@ -41,6 +41,11 @@ class AIAgent:
         Args:
             user_input: The user's input text
             context: Optional context dictionary for maintaining conversation state
+                    Special keys:
+                    - is_greeting: True if this is the initial greeting
+                    - has_tasks: Whether there are any tasks
+                    - task_count: Number of current tasks
+                    - history: List of previous message exchanges
         
         Returns:
             str: The agent's response
@@ -71,29 +76,37 @@ class AIAgent:
                 self._requires_deep_thinking(user_input)
             )
 
+            response_chunks = []
             try:
                 if use_o3_mini:
-                    response = await self.o3_mini.process(user_input, context)
+                    async for chunk in self.o3_mini.process(user_input, context):
+                        response_chunks.append(chunk)
                     model_used = "o3-mini"
                 else:
                     if not self.chatgpt.is_available:
                         raise RuntimeError("ChatGPT is not available and this input requires it")
-                    response = await self.chatgpt.process(user_input, context)
+                    async for chunk in self.chatgpt.process(user_input, context):
+                        response_chunks.append(chunk)
                     model_used = "gpt-4"
 
             except Exception as model_error:
                 # If primary model fails, try fallback to the other model
                 logger.warning(f"Primary model failed: {str(model_error)}")
+                response_chunks = []
                 if use_o3_mini and self.chatgpt.is_available:
                     logger.info("Falling back to ChatGPT")
-                    response = await self.chatgpt.process(user_input, context)
+                    async for chunk in self.chatgpt.process(user_input, context):
+                        response_chunks.append(chunk)
                     model_used = "gpt-4"
                 elif not use_o3_mini and self.o3_mini.is_available:
                     logger.info("Falling back to O3-mini")
-                    response = await self.o3_mini.process(user_input, context)
+                    async for chunk in self.o3_mini.process(user_input, context):
+                        response_chunks.append(chunk)
                     model_used = "o3-mini"
                 else:
                     raise
+
+            response = "".join(response_chunks)
 
             # Store the conversation
             conversation = Conversation(
@@ -133,14 +146,16 @@ class AIAgent:
         deep_thinking_keywords = {'analyze', 'compare', 'evaluate', 'synthesize'}
         return any(keyword in input_text.lower() for keyword in deep_thinking_keywords)
 
-    async def process_tasks(self) -> None:
+    async def process_tasks(self) -> List[dict]:
         """
         Main task processing loop that:
         1. Loads tasks by urgency
         2. Chunks them appropriately
         3. Gets summaries and presents them
-        4. Handles user interaction
-        5. Updates task status
+        4. Returns the list of tasks for further interaction
+        
+        Returns:
+            List[dict]: List of all processed tasks
         """
         try:
             # Get all tasks ordered by urgency
@@ -155,38 +170,22 @@ class AIAgent:
                     all_tasks.extend(half_finished)
 
             if not all_tasks:
-                logger.info("No tasks available for processing")
-                return
+                print("No tasks available.")
+                return []
 
             # Chunk tasks for processing
             task_chunks = self._chunk_tasks(all_tasks)
             
-            for chunk in task_chunks:
+            for i, chunk in enumerate(task_chunks, 1):
+                print(f"\nTask Group {i}:")
                 # Get summary from ChatGPT
                 chunk_text = self._format_tasks_for_summary(chunk)
-                summary = await self.chatgpt.summarize_tasks(chunk_text)
-                print("\nTask Summary:")
+                summary = ""
+                async for chunk in self.chatgpt.summarize_tasks(chunk_text):
+                    summary += chunk
                 print(summary)
 
-                # Get user input for task selection
-                while True:
-                    user_input = input("\nEnter task ID to process, 'help' for assistance, or press Enter to continue: ").strip()
-                    
-                    if not user_input:
-                        break
-                    elif user_input.lower() == 'help':
-                        self._show_task_help()
-                        continue
-                    elif user_input.isdigit():
-                        task_id = int(user_input)
-                        task = next((t for t in chunk if t['id'] == task_id), None)
-                        
-                        if task:
-                            await self._process_selected_task(task)
-                        else:
-                            print(f"Task {task_id} not found in current chunk")
-                    else:
-                        print("Invalid input. Please enter a task ID or press Enter to continue")
+            return all_tasks
 
         except Exception as e:
             logger.error(f"Error in task processing: {str(e)}")
@@ -246,55 +245,75 @@ class AIAgent:
         
         return "\n".join(formatted_tasks)
 
-    async def _process_selected_task(self, task: dict) -> None:
+    async def process_selected_task(self, task_id: int) -> None:
         """
-        Process a selected task by generating an action prompt and handling user input.
+        Process a selected task by generating an action prompt and handling user interaction.
         
         Args:
-            task: Task dictionary
+            task_id: The ID of the task to process
+            
+        Raises:
+            ValueError: If the task is not found
         """
-        # Generate and display action prompt
-        action_prompt = await self.chatgpt.generate_action_prompt(task)
-        print("\n" + action_prompt)
+        try:
+            # Get the task from the database
+            task = self.db.query(Task).filter(Task.id == task_id).first()
+            if not task:
+                raise ValueError(f"Task {task_id} not found")
 
-        # Get user action
-        action = input("\nYour command (help/remind/skip/complete): ").strip().lower()
-        
-        # Process the action
-        if action == 'help':
-            # Mark as half-completed and set a reminder
-            update_task_status(
-                task['id'],
-                'half-completed',
-                datetime.utcnow()  # You might want to add some time delta
-            )
-            print(f"Task {task['id']} marked as needing help. A reminder has been set.")
-            
-        elif action == 'remind':
-            # Keep current status but set a reminder
-            reminder_time = datetime.utcnow()  # You might want to add some time delta
-            update_task_status(task['id'], task['status'], reminder_time)
-            print(f"Reminder set for task {task['id']}.")
-            
-        elif action == 'complete':
-            # Mark as completed with no reminder
-            update_task_status(task['id'], 'completed', None)
-            print(f"Task {task['id']} marked as completed.")
-            
-        elif action == 'skip':
-            print(f"Skipping task {task['id']}.")
-            
-        else:
-            print("Invalid command. No changes made to the task.")
+            # Convert task to dictionary for the action prompt
+            task_dict = {
+                'id': task.id,
+                'description': task.description,
+                'urgency': task.urgency,
+                'deadline': task.deadline.isoformat() if task.deadline else None,
+                'category': task.category,
+                'status': task.status
+            }
 
-    def _show_task_help(self) -> None:
-        """Display help information for task processing."""
-        print("\nTask Processing Commands:")
-        print("  help    - Show this help message")
-        print("  remind  - Set a reminder for the task")
-        print("  skip    - Skip this task for now")
-        print("  complete - Mark the task as completed")
-        print("\nOr press Enter to continue to the next chunk of tasks.")
+            # Generate and display action prompt
+            prompt = ""
+            async for chunk in self.chatgpt.generate_action_prompt(task_dict):
+                prompt += chunk
+            print("\n" + prompt)
+
+            while True:
+                action = input("\nYour action (complete/remind/help/skip/back): ").strip().lower()
+                
+                if action == 'back':
+                    break
+                elif action == 'complete':
+                    update_task_status(task_id, 'completed', None)
+                    print(f"Task {task_id} marked as completed.")
+                    break
+                elif action == 'remind':
+                    # Set reminder for tomorrow
+                    reminder_time = datetime.utcnow() + timedelta(days=1)
+                    update_task_status(task_id, task.status, reminder_time)
+                    print(f"Reminder set for task {task_id} for tomorrow.")
+                    break
+                elif action == 'help':
+                    update_task_status(task_id, 'half-completed', datetime.utcnow())
+                    print(f"Task {task_id} marked as needing help. I'll help you break it down.")
+                    
+                    # Generate help response
+                    help_response = ""
+                    async for chunk in self.chatgpt.process(
+                        f"Help me break down this task: {task.description}",
+                        context={'task_id': task_id}
+                    ):
+                        help_response += chunk
+                    print("\n" + help_response)
+                    break
+                elif action == 'skip':
+                    print(f"Skipping task {task_id}.")
+                    break
+                else:
+                    print("Invalid action. Available actions: complete, remind, help, skip, back")
+
+        except Exception as e:
+            logger.error(f"Error processing selected task: {str(e)}")
+            raise
 
     def __del__(self):
         """Cleanup resources."""

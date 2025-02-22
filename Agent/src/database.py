@@ -9,7 +9,7 @@ from sqlalchemy.dialects.mysql import DATETIME
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import text
 
-from .config import DATABASE_URL
+from config import DATABASE_URL
 
 # Create database engine
 engine = create_engine(DATABASE_URL)
