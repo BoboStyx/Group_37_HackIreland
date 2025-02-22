@@ -5,6 +5,7 @@ from typing import Optional
 import logging
 import json
 from datetime import datetime
+import re
 
 from agent import AIAgent
 from config import LOG_LEVEL
@@ -19,7 +20,7 @@ class AgentCLI:
         """Initialize the CLI interface."""
         self.agent = AIAgent()
         self.context = {}
-        self.profile_manager = ProfileManager()
+        self.profile_manager = ProfileManager(debug_profile=False)
 
     async def _stream_output(self, prefix: str = "\nAI: ") -> str:
         """
@@ -57,7 +58,8 @@ class AgentCLI:
             self.context = {
                 "history": [],  # Store conversation history
                 "available_tasks": [],  # Store available tasks
-                "profile": profile  # Load and maintain profile in context
+                "profile": profile,  # Load and maintain profile in context
+                "current_task_id": None  # Track the current task being discussed
             }
             
             # Get initial tasks and context
@@ -77,7 +79,8 @@ class AgentCLI:
                     "should_be_direct": True,
                     "available_tasks": tasks,
                     "history": self.context["history"],  # Include conversation history
-                    "profile": self.context["profile"]  # Include profile in greeting
+                    "profile": self.context["profile"],  # Include profile in greeting
+                    "current_task_id": None  # No current task during greeting
                 }
             ):
                 greeting += chunk
@@ -88,73 +91,85 @@ class AgentCLI:
             # Store the greeting in conversation history
             self.context["history"].append({"role": "assistant", "content": greeting})
             self.context["available_tasks"] = tasks
-            
+
+            while True:
+                try:
+                    user_input = input("\nYou: ").strip()
+
+                    if not user_input:
+                        continue
+                    
+                    # Store user input in history
+                    self.context["history"].append({"role": "user", "content": user_input})
+                    
+                    # Handle explicit commands first
+                    command = user_input.lower()
+                    if command == 'exit':
+                        print("\nAI: Goodbye! Let me know if you need anything else.")
+                        break
+                    elif command == 'help':
+                        self._show_help()
+                        continue
+                    elif command == 'profile':
+                        await self._handle_profile_command()
+                        continue
+                    
+                    # Check if user is selecting a task by ID
+                    task_match = re.match(r'^task\s+#?(\d+)$', command)
+                    if task_match:
+                        task_id = int(task_match.group(1))
+                        # Update current task ID in context
+                        self.context["current_task_id"] = task_id
+                        # Process the selected task
+                        async for chunk in self.agent.process_selected_task(task_id):
+                            print(chunk, end="", flush=True)
+                        print()
+                        continue
+                    
+                    # For everything else, process naturally with task context
+                    try:
+                        # Refresh tasks to ensure we have the latest state
+                        tasks = await self.agent.get_tasks()
+                        self.context["available_tasks"] = tasks
+                        
+                        # Process the input with full context
+                        response = ""
+                        _, stream = await self._stream_output()
+                        async for chunk in self.agent.handle_task_input(
+                            user_input,
+                            tasks,
+                            {
+                                **self.context,  # Include all context
+                                "available_tasks": tasks,  # Update with latest tasks
+                                "profile": await self.profile_manager.get_profile()  # Get latest profile
+                            }
+                        ):
+                            response += chunk
+                            await stream(chunk)
+                        
+                        print()  # Add a newline after streaming
+                        
+                        # Store AI response in history
+                        self.context["history"].append({"role": "assistant", "content": response})
+                        
+                        # Keep history at a reasonable size (last 10 exchanges)
+                        if len(self.context["history"]) > 20:  # 10 exchanges = 20 messages
+                            self.context["history"] = self.context["history"][-20:]
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing input: {str(e)}")
+                        print("\nAI: I ran into an issue processing that. Could you rephrase or try something else?")
+
+                except KeyboardInterrupt:
+                    print("\nAI: Goodbye! Have a great day!")
+                    break
+                except Exception as e:
+                    logger.error(f"Error in interactive mode: {str(e)}")
+                    print("\nAI: Something unexpected happened. Let's try that again.")
+
         except Exception as e:
             logger.error(f"Error during initial greeting: {str(e)}")
             print("\nAI: Hello! I encountered a small issue getting started, but I'm ready to help now.")
-        
-        while True:
-            try:
-                user_input = input("\nYou: ").strip()
-
-                if not user_input:
-                    continue
-                
-                # Store user input in history
-                self.context["history"].append({"role": "user", "content": user_input})
-                
-                # Handle explicit commands first
-                command = user_input.lower()
-                if command == 'exit':
-                    print("\nAI: Goodbye! Let me know if you need anything else.")
-                    break
-                elif command == 'help':
-                    self._show_help()
-                    continue
-                elif command == 'profile':
-                    await self._handle_profile_command()
-                    continue
-                
-                # For everything else, process naturally with task context
-                try:
-                    # Refresh tasks to ensure we have the latest state
-                    tasks = await self.agent.get_tasks()
-                    self.context["available_tasks"] = tasks
-                    
-                    # Process the input with full context
-                    response = ""
-                    _, stream = await self._stream_output()
-                    async for chunk in self.agent.handle_task_input(
-                        user_input,
-                        tasks,
-                        {
-                            **self.context,  # Include all context
-                            "available_tasks": tasks,  # Update with latest tasks
-                            "profile": await self.profile_manager.get_profile()  # Get latest profile
-                        }
-                    ):
-                        response += chunk
-                        await stream(chunk)
-                    
-                    print()  # Add a newline after streaming
-                    
-                    # Store AI response in history
-                    self.context["history"].append({"role": "assistant", "content": response})
-                    
-                    # Keep history at a reasonable size (last 10 exchanges)
-                    if len(self.context["history"]) > 20:  # 10 exchanges = 20 messages
-                        self.context["history"] = self.context["history"][-20:]
-                    
-                except Exception as e:
-                    logger.error(f"Error processing input: {str(e)}")
-                    print("\nAI: I ran into an issue processing that. Could you rephrase or try something else?")
-
-            except KeyboardInterrupt:
-                print("\nAI: Goodbye! Have a great day!")
-                break
-            except Exception as e:
-                logger.error(f"Error in interactive mode: {str(e)}")
-                print("\nAI: Something unexpected happened. Let's try that again.")
 
     async def _handle_profile_command(self):
         """Handle the profile command and its subcommands."""
@@ -162,13 +177,14 @@ class AgentCLI:
         print("1. Add profile information")
         print("2. View current profile")
         print("3. View profile history")
-        print("4. Back to main menu")
+        print("4. Clear profile history")
+        print("5. Back to main menu")
 
         while True:
             try:
-                choice = input("\nEnter your choice (1-4): ").strip()
+                choice = input("\nEnter your choice (1-5): ").strip()
 
-                if choice == '4' or not choice:
+                if choice == '5' or not choice:
                     break
                 elif choice == '1':
                     print("\nEnter or paste any information about yourself.")
@@ -230,8 +246,18 @@ class AgentCLI:
                     input("\nPress Enter to continue...")
                     break
 
+                elif choice == '4':
+                    confirm = input("\nAre you sure you want to clear your profile history? This cannot be undone. (yes/no): ").strip().lower()
+                    if confirm == 'yes':
+                        await self.profile_manager.clear_profile()
+                        print("\nAI: Profile history has been cleared.")
+                    else:
+                        print("\nAI: Profile clear operation cancelled.")
+                    input("\nPress Enter to continue...")
+                    break
+
                 else:
-                    print("\nAI: Invalid choice. Please enter a number between 1 and 4.")
+                    print("\nAI: Invalid choice. Please enter a number between 1 and 5.")
 
             except Exception as e:
                 logger.error(f"Error handling profile command: {str(e)}")
@@ -263,6 +289,7 @@ def main():
     """Main entry point for the CLI."""
     parser = argparse.ArgumentParser(description="AI Agent Command Line Interface")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--debug-profile", action="store_true", help="Enable detailed profile logging")
     args = parser.parse_args()
 
     if args.debug:
@@ -273,6 +300,9 @@ def main():
     init_db()
 
     cli = AgentCLI()
+    if args.debug_profile:  # Update profile manager with debug flag if set
+        cli.profile_manager = ProfileManager(debug_profile=True)
+        
     try:
         asyncio.run(cli.interactive_mode())
     except KeyboardInterrupt:

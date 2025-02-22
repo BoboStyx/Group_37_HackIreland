@@ -14,10 +14,39 @@ from sqlalchemy import Column, Integer, String, Text, DateTime
 logger = logging.getLogger(__name__)
 
 class ProfileManager:
-    def __init__(self):
+    def __init__(self, debug_profile: bool = False):
         """Initialize the profile manager."""
         self.chatgpt = ChatGPTAgent()
-        self.db = SessionLocal()
+        self.debug_profile = debug_profile
+
+    def _log_profile_debug(self, message: str, data: Any = None):
+        """Helper method to log profile-related debug information."""
+        if self.debug_profile:
+            if data:
+                logger.info(f"{message}: {json.dumps(data, indent=2)}")
+            else:
+                logger.info(message)
+
+    async def clear_profile(self) -> bool:
+        """
+        Clear the user's profile history.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        db = SessionLocal()
+        try:
+            self._log_profile_debug("Attempting to clear profile history")
+            db.query(UserProfile).delete()
+            db.commit()
+            self._log_profile_debug("Successfully cleared profile history")
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing profile: {str(e)}")
+            db.rollback()
+            return False
+        finally:
+            db.close()
 
     async def process_input(self, input_text: str, is_direct_input: bool = False) -> Tuple[Dict[str, Any], Optional[str]]:
         """
@@ -30,6 +59,7 @@ class ProfileManager:
         Returns:
             Tuple[Dict[str, Any], Optional[str]]: Updated profile and insight message if profile was updated
         """
+        db = SessionLocal()  # Create a new session for this operation
         try:
             # First, analyze the input for relevant user information
             analysis_prompt = f"""Analyze this {'profile information' if is_direct_input else 'conversation'} for relevant details about the user.
@@ -39,6 +69,7 @@ class ProfileManager:
             
             If this is direct profile input, extract all relevant information.
             If this is conversation, only extract information if it reveals something meaningful about the user's:
+            - Name: The user's name if provided (e.g., "My name is Bob")
             - Background
             - Experience
             - Interests
@@ -85,10 +116,23 @@ class ProfileManager:
                 return {}, None
 
             # If we have relevant info, get the current profile or create a new one
-            current_profile = await self._get_or_create_profile()
+            profile_record = db.query(UserProfile).first()
+            if not profile_record:
+                profile_record = UserProfile(
+                    created_at=datetime.utcnow(),
+                    raw_input="",
+                    structured_profile=json.dumps({"_meta": {"created_at": datetime.utcnow().isoformat()}})
+                )
+                db.add(profile_record)
+                db.flush()  # Flush to get the ID
+
+            current_profile = json.loads(profile_record.structured_profile)
+            
+            # Log the analysis data
+            self._log_profile_debug("Analysis data", analysis_data)
             
             # Merge the new information
-            merge_prompt = f"""Merge this new user information into their existing profile.
+            merge_prompt = f"""Merge this new user information into their existing profile. If the new information includes a name, update or add it under the key "name".
             
             Current profile:
             {json.dumps(current_profile, indent=2)}
@@ -132,8 +176,11 @@ class ProfileManager:
                 insight = merge_data['insight']
             except (json.JSONDecodeError, AttributeError, KeyError) as e:
                 logger.error(f"Failed to parse merge response: {e}")
-                logger.debug(f"Raw response: {merge_result}")
+                self._log_profile_debug("Raw response", merge_result)
                 return current_profile, None
+            
+            # Log the current profile before merge
+            self._log_profile_debug("Current profile before merge", current_profile)
             
             # Update metadata
             if '_meta' not in updated_profile:
@@ -144,67 +191,36 @@ class ProfileManager:
                 'last_update_confidence': analysis_data['confidence']
             })
             
-            # Update the database
-            try:
-                profile_record = await self._get_or_create_profile_record()
-                profile_record.raw_input = (
-                    f"{profile_record.raw_input}\n\n"
-                    f"--- {'Direct Input' if is_direct_input else 'Conversation Insight'} "
-                    f"({datetime.utcnow().isoformat()}) ---\n{input_text}"
-                )
-                profile_record.structured_profile = json.dumps(updated_profile)
-                profile_record.updated_at = datetime.utcnow()
-                self.db.commit()
-            except Exception as e:
-                logger.error(f"Failed to update database: {e}")
-                # Still return the updated profile even if db update fails
-                return updated_profile, insight
-
+            # Log the merge result
+            self._log_profile_debug("Merge result", merge_data)
+            
+            # Update the database record
+            profile_record.raw_input = (
+                f"{profile_record.raw_input}\n\n"
+                f"--- {'Direct Input' if is_direct_input else 'Conversation Insight'} "
+                f"({datetime.utcnow().isoformat()}) ---\n{input_text}"
+            )
+            profile_record.structured_profile = json.dumps(updated_profile)
+            profile_record.updated_at = datetime.utcnow()
+            
+            # Log the final profile being saved
+            self._log_profile_debug("Saving updated profile", updated_profile)
+            
+            # Commit the transaction
+            self._log_profile_debug("Committing profile update to database...")
+            db.commit()
+            self._log_profile_debug(f"Successfully committed profile update. Profile ID: {profile_record.id}")
+            
             return updated_profile, insight
 
         except Exception as e:
-            logger.error(f"Error processing profile input: {e}")
-            # Return empty profile on error
+            logger.error(f"Error processing profile input: {str(e)}")
+            self._log_profile_debug("Rolling back database transaction due to error")
+            db.rollback()  # Rollback on error
             return {}, None
-
-    async def _get_or_create_profile(self) -> Dict[str, Any]:
-        """Get the current profile or create a new empty one."""
-        try:
-            profile_record = await self._get_or_create_profile_record()
-            return json.loads(profile_record.structured_profile)
-        except Exception:
-            return {"_meta": {"created_at": datetime.utcnow().isoformat()}}
-
-    async def _get_or_create_profile_record(self) -> UserProfile:
-        """Get or create the UserProfile record."""
-        profile = self.db.query(UserProfile).first()
-        if not profile:
-            profile = UserProfile(
-                created_at=datetime.utcnow(),
-                raw_input="",
-                structured_profile=json.dumps({"_meta": {"created_at": datetime.utcnow().isoformat()}})
-            )
-            self.db.add(profile)
-            self.db.commit()
-        return profile
-
-    async def get_raw_profile(self) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve the raw profile data.
-            
-        Returns:
-            Dict containing raw_input and timestamps, or None if not found
-        """
-        try:
-            profile = await self._get_or_create_profile_record()
-            return {
-                'raw_input': profile.raw_input,
-                'created_at': profile.created_at.isoformat(),
-                'updated_at': profile.updated_at.isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Error retrieving raw profile: {str(e)}")
-            raise
+        finally:
+            self._log_profile_debug("Closing database session")
+            db.close()  # Always close the session
 
     async def get_profile(self) -> Dict[str, Any]:
         """
@@ -213,12 +229,53 @@ class ProfileManager:
         Returns:
             Dict containing the structured profile
         """
+        db = SessionLocal()
         try:
-            profile = await self._get_or_create_profile_record()
-            return json.loads(profile.structured_profile)
+            self._log_profile_debug("Querying database for current profile...")
+            profile_record = db.query(UserProfile).first()
+            if not profile_record:
+                self._log_profile_debug("No profile found in database, returning empty profile")
+                return {"_meta": {"created_at": datetime.utcnow().isoformat()}}
+            
+            # Log the actual profile data being retrieved
+            profile_data = json.loads(profile_record.structured_profile)
+            self._log_profile_debug("Retrieved profile data", profile_data)
+            
+            self._log_profile_debug(f"Successfully retrieved profile. Profile ID: {profile_record.id}")
+            return profile_data
         except Exception as e:
             logger.error(f"Error retrieving profile: {str(e)}")
-            raise
+            return {"_meta": {"created_at": datetime.utcnow().isoformat()}}
+        finally:
+            self._log_profile_debug("Closing database session")
+            db.close()
+
+    async def get_raw_profile(self) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve the raw profile data.
+            
+        Returns:
+            Dict containing raw_input and timestamps, or None if not found
+        """
+        db = SessionLocal()
+        try:
+            logger.info("Querying database for raw profile data...")
+            profile_record = db.query(UserProfile).first()
+            if not profile_record:
+                logger.info("No profile found in database")
+                return None
+            logger.info(f"Successfully retrieved raw profile. Profile ID: {profile_record.id}")
+            return {
+                'raw_input': profile_record.raw_input,
+                'created_at': profile_record.created_at.isoformat(),
+                'updated_at': profile_record.updated_at.isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Error retrieving raw profile: {str(e)}")
+            return None
+        finally:
+            logger.debug("Closing database session")
+            db.close()
 
     def __del__(self):
         """Cleanup resources."""

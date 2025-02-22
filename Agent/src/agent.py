@@ -108,12 +108,23 @@ class AIAgent:
                 
                 Make it feel like a natural conversation starter with a helpful colleague who knows what needs attention."""
                 
-                async for chunk in self.chatgpt.process(greeting_prompt, {
+                # Create a new context dictionary that preserves all existing keys
+                greeting_context = context.copy()
+                greeting_context.update({
                     "role": "greeter",
                     "style": "warm",
                     "focus": "welcoming",
                     "history": context.get('history', [])
-                }):
+                })
+                
+                # Get latest profile if not already in context
+                if 'profile' not in greeting_context:
+                    profile_manager = ProfileManager()
+                    profile = await profile_manager.get_profile()
+                    if profile:
+                        greeting_context['profile'] = profile
+                
+                async for chunk in self.chatgpt.process(greeting_prompt, greeting_context):
                     yield chunk
                 return
 
@@ -808,115 +819,128 @@ class AIAgent:
             except Exception as e:
                 logger.error(f"Error closing database connection: {str(e)}")
 
-    async def handle_task_input(self, user_input: str, available_items: List[dict], context: Optional[Dict[str, Any]] = None) -> AsyncGenerator[str, None]:
-        """
-        Handle natural language input about tasks and information items.
+    def _is_action_directive(self, text: str) -> bool:
+        """Check if text is part of an action directive."""
+        # Patterns for task and profile actions
+        task_patterns = [
+            r'\[ACTION:(\w+):(\d+):([^\]]*)\]',
+            r'\[ACTION:(\w+):task_id:([^\]:]+):([^\]]*)\]',
+            r'\[ACTION:(\w+):task_id:([^\]]*)\]'
+        ]
+        profile_pattern = r'\[ACTION:profile:(\w+):([^\]]*)\]'
         
-        Args:
-            user_input: The user's input text
-            available_items: List of available tasks and information items
-            context: Optional context dictionary including conversation history
-            
-        Returns:
-            AsyncGenerator[str, None]: The AI's response chunks
-        """
+        # Check if text starts with '[' and matches any action pattern
+        if not text.startswith('['):
+            return False
+        
+        for pattern in task_patterns:
+            if re.match(pattern, text):
+                return True
+        
+        if re.match(profile_pattern, text):
+            return True
+        
+        return False
+
+    async def handle_task_input(self, user_input: str, available_items: List[dict], context: Optional[Dict[str, Any]] = None) -> AsyncGenerator[str, None]:
         try:
-            # Update context with current item if we're discussing one
-            current_item = None
-            if context and 'current_task_id' in context:
-                current_item = next(
-                    (i for i in available_items if i.get('id') == context['current_task_id']),
-                    None
-                )
-
-            # Check if input is an item ID first
-            if user_input.isdigit():
-                item_id = int(user_input)
-                item = next((i for i in available_items if i.get('id') == item_id), None)
-                if item:
-                    # Update context to focus on this item
-                    if context is not None:
-                        context['current_task_id'] = item_id
-                    async for chunk in self._discuss_specific_item(item):
-                        yield chunk
-                    return
-                yield "I couldn't find that item. Could you try another one or describe what you're interested in?"
-                return
+            # Initialize context if None
+            if context is None:
+                context = {}
             
-            # Format conversation history for the prompt
-            conversation_context = ""
-            if context and 'history' in context:
-                # Get last few exchanges for context
-                recent_history = context['history'][-6:]  # Last 3 exchanges (6 messages)
-                if recent_history:
-                    conversation_context = "\nRecent conversation:\n"
-                    for msg in recent_history:
-                        role = "User" if msg['role'] == 'user' else "AI"
-                        conversation_context += f"{role}: {msg['content']}\n"
+            # Create a new context dictionary that preserves all existing keys
+            new_context = context.copy()
             
-            # Create a prompt for the AI to understand and respond to the input
-            prompt = f"""You are a helpful AI assistant discussing both tasks and interesting information/opportunities. The user has just said: "{user_input}"
-
-            {conversation_context}
-
-            Current context:
-            {f'We are currently discussing {"Task" if current_item.get("type", "task") == "task" else "Info"} #{current_item["id"]}: {current_item["description"]}' if current_item else 'No specific item in focus'}
-
-            Available items:
-            {self._format_tasks_for_ai(available_items)}
-
-            Based on what the user said and our conversation history:
-            1. Remember previous context and maintain conversation continuity
-            2. If they mentioned completing a task, mark it as complete
-            3. If they want to set a reminder, use the [ACTION:remind] directive
-            4. If they're asking about the current item, stay focused on it
-            5. If they want more details about an information item, provide them
-            6. If they want to draft an email about a task, help compose it
-            7. If they're asking about task status or progress, provide relevant updates
-            8. If they're expressing interest in an opportunity, explore it with them
-            
-            Be conversational and helpful. If you need to take action, indicate that in your response with [ACTION:action_type:item_id:details].
-            
-            Available actions:
-            [ACTION:complete:123:null] - Mark task as complete
-            [ACTION:remind:456:2h] - Set a reminder (use 24h for tomorrow)
-            [ACTION:help:789:break_down] - Help break down task
-            [ACTION:draft_email:123:{{"subject":"Meeting Follow-up","to":"team@example.com"}}] - Draft an email
-            [ACTION:explore:123:null] - Explore an information item in detail
-            
-            Keep your response natural and friendly, like a helpful colleague.
-            Stay focused on the current item if we're discussing one.
-            
-            If they're asking about finding something easy or interesting:
-            1. Look for tasks with lower urgency (1-2)
-            2. Check for tasks without dependencies
-            3. Consider task complexity from the description
-            4. Look for interesting information items that might energize them
-            5. Suggest the most approachable or engaging item"""
-
-            # Get the AI's response
-            response = ""
-            async for chunk in self.chatgpt.process(prompt, {
+            # Add current datetime to context
+            current_time = datetime.utcnow()
+            new_context.update({
                 "role": "task_helper",
                 "style": "conversational",
                 "focus": "context_aware",
-                "current_item": current_item,
-                "history": context.get('history', []) if context else []
-            }):
-                response += chunk
-                yield chunk
+                "current_item": None,
+                "available_tasks": available_items,
+                "current_time": current_time.isoformat(),
+                "current_time_readable": current_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "user_timezone": "Europe/Dublin"  # Since you're in Ireland
+            })
             
-            # Process any actions in the response
+            logger.info(f"Processing input at {current_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            
+            # Handle any datetime objects in the context
+            def process_context(obj):
+                if isinstance(obj, dict):
+                    return {k: process_context(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [process_context(item) for item in obj]
+                elif isinstance(obj, datetime):
+                    return obj.isoformat()
+                return obj
+            
+            new_context = process_context(new_context)
+            
+            # Get current task ID if available
+            current_task_id = None
+            if 'current_task_id' in context:
+                current_task_id = context['current_task_id']
+            elif 'current_item' in context and context['current_item']:
+                current_task_id = context['current_item'].get('id')
+            
+            # Check for task modifications if we have a current task
+            if current_task_id:
+                modification = await self._identify_task_modification(user_input, current_task_id)
+                if modification:
+                    response = await self._apply_task_modification(modification)
+                    if response:
+                        yield response
+                        return
+            
+            # Get response from ChatGPT
+            response = ""
+            buffer = ""  # Buffer for accumulating potential action directive text
+            
+            async for chunk in self.chatgpt.process(user_input, new_context):
+                buffer += chunk
+                
+                # If buffer starts with '[', accumulate until we can determine if it's an action
+                if buffer.startswith('['):
+                    # If we have a complete action directive, process it and clear buffer
+                    if ']' in buffer:
+                        action_end = buffer.index(']') + 1
+                        potential_action = buffer[:action_end]
+                        remaining_text = buffer[action_end:]
+                        
+                        if self._is_action_directive(potential_action):
+                            # Add to response but don't yield
+                            response += potential_action
+                            # Yield remaining text if any
+                            if remaining_text:
+                                yield remaining_text
+                        else:
+                            # Not an action directive, yield entire buffer
+                            yield buffer
+                    else:
+                        # Otherwise keep accumulating
+                        continue
+                else:
+                    # No potential action directive, yield buffer
+                    yield buffer
+                    buffer = ""
+                
+                response += chunk
+            
+            # Handle any remaining buffer
+            if buffer:
+                if not self._is_action_directive(buffer):
+                    yield buffer
+                else:
+                    response += buffer
+            
+            # Extract and handle any actions from the response
             actions = self._extract_actions(response)
             for action in actions:
-                # Log the action being processed
-                logger.info(f"Processing action: {action}")
                 action_response = await self._handle_action(action, response)
-                if action_response != response:  # Only update if the action changed something
-                    response = action_response
-                    logger.info("Action processed successfully")
-                    # Yield any changes from action processing
-                    yield "\n" + action_response.replace(response, "").strip()
+                if action_response:
+                    yield action_response
 
         except Exception as e:
             logger.error(f"Error handling input: {str(e)}")
@@ -966,15 +990,58 @@ class AIAgent:
     def _extract_actions(self, response: str) -> List[dict]:
         """Extract action directives from the AI's response."""
         actions = []
-        pattern = r'\[ACTION:(\w+):(\d+):([^\]]*)\]'
-        matches = re.findall(pattern, response)
+        logger.info(f"Extracting actions from response: {response}")
         
-        for action_type, task_id, details in matches:
-            actions.append({
-                'type': action_type,
-                'task_id': int(task_id),
+        # Match task actions - handle both numeric IDs and named parameters
+        task_patterns = [
+            r'\[ACTION:(\w+):(\d+):([^\]]*)\]',  # Numeric ID pattern
+            r'\[ACTION:(\w+):task_id:([^\]:]+):([^\]]*)\]',  # Named parameter pattern
+            r'\[ACTION:(\w+):task_id:([^\]]*)\]',  # Simple named parameter pattern
+            r'\[ACTION:create_task:([^\]]*)\]'  # Create task pattern
+        ]
+        
+        for pattern in task_patterns:
+            task_matches = re.findall(pattern, response)
+            for match in task_matches:
+                if isinstance(match, tuple):
+                    if len(match) == 3:
+                        action_type, task_id_or_value, details = match
+                        # For numeric pattern
+                        try:
+                            task_id = int(task_id_or_value)
+                        except ValueError:
+                            # For named parameter pattern where task_id might be a value
+                            task_id = None
+                            details = task_id_or_value
+                    elif len(match) == 2:
+                        # For simple named parameter pattern
+                        action_type, details = match
+                        task_id = None
+                else:
+                    # For create task pattern
+                    action_type = 'create_task'
+                    details = match
+                    task_id = None
+                
+                action = {
+                    'type': action_type,
+                    'task_id': task_id,
+                    'details': details
+                }
+                logger.info(f"Extracted task action: {action}")
+                actions.append(action)
+        
+        # Match profile actions
+        profile_pattern = r'\[ACTION:profile:(\w+):([^\]]*)\]'
+        profile_matches = re.findall(profile_pattern, response)
+        for subtype, details in profile_matches:
+            action = {
+                'type': 'profile',
+                'subtype': subtype,
                 'details': details
-            })
+            }
+            logger.info(f"Extracted profile action: {action}")
+            actions.append(action)
         
         return actions
 
@@ -982,34 +1049,101 @@ class AIAgent:
         """Handle an action directive and update the response."""
         try:
             action_feedback = None
+            logger.info(f"Processing action: {action}")
+            
+            # Handle create_task action
+            if action['type'] == 'create_task':
+                try:
+                    task_details = json.loads(action['details'])
+                    description = task_details.get('description')
+                    urgency = task_details.get('urgency', 3)  # Default urgency of 3
+                    deadline = task_details.get('deadline')
+                    notes = task_details.get('notes')
+                    
+                    # Create the task
+                    task_id = await self.create_new_task(description, urgency)
+                    
+                    # Add notes if provided
+                    if notes:
+                        await self.add_task_notes(task_id, notes)
+                    
+                    action_feedback = f"\n[✓ Created new task #{task_id}: {description}]"
+                    logger.info(f"Created new task {task_id}. Details: {task_details}")
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid task creation details: {e}")
+                    action_feedback = "\n[❌ Failed to create task - invalid format]"
+                except Exception as e:
+                    logger.error(f"Error creating task: {e}")
+                    action_feedback = "\n[❌ Failed to create task]"
+            
+            # If we don't have a task_id but have details that look like a time specification
+            elif action['type'] == 'remind' and not action['task_id']:
+                # Get the most recent task from context
+                tasks = await self.get_tasks()
+                if not tasks:
+                    logger.error("No tasks found when trying to set reminder")
+                    return response
+                
+                # Find the first incomplete task
+                task = next((t for t in tasks if t.get('status') != 'completed'), None)
+                if not task:
+                    logger.error("No incomplete tasks found when trying to set reminder")
+                    return response
+                
+                action['task_id'] = task['id']
+                logger.info(f"Using task ID {action['task_id']} for reminder")
+            
+            if not action['task_id'] and action['type'] not in ['profile', 'explore', 'create_task']:
+                logger.error(f"No task ID provided for action: {action}")
+                return response
+            
             if action['type'] == 'complete':
-                update_task_status(action['task_id'], 'completed', None)
-                action_feedback = f"\n[✓ Task #{action['task_id']} has been marked as completed]"
-                logger.info(f"Completed task {action['task_id']}")
+                task_id = action['task_id']
+                update_task_status(task_id, 'completed', None)
+                action_feedback = f"\n[✓ Task #{task_id} has been marked as completed]"
+                logger.info(f"Task {task_id} marked as completed. Details: {action['details']}")
+                
             elif action['type'] == 'remind':
-                # Handle "tomorrow" in a more natural way
-                if action['details'] == '24h' or action['details'].lower() == 'tomorrow':
-                    reminder_time = datetime.utcnow() + timedelta(days=1)
-                    reminder_time = reminder_time.replace(hour=9, minute=0)  # Set to 9 AM tomorrow
-                else:
-                    reminder_time = self._parse_reminder_time(action['details'])
+                task_id = action['task_id']
+                # Parse the time from details
+                time_details = action['details']
+                if isinstance(time_details, str):
+                    # Extract numeric value and unit
+                    match = re.match(r'(\d+)_?([hd])(ours?|ays?)?', time_details)
+                    if match:
+                        value, unit = match.group(1), match.group(2)
+                        time_details = f"{value}{unit}"
+                
+                reminder_time = self._parse_reminder_time(time_details)
                 
                 if reminder_time:
-                    update_task_status(action['task_id'], 'pending', reminder_time)
+                    update_task_status(task_id, 'pending', reminder_time)
                     if isinstance(reminder_time, datetime):
                         time_str = reminder_time.strftime('%Y-%m-%d %H:%M')
-                        action_feedback = f"\n[⏰ Reminder set for Task #{action['task_id']} at {time_str}]"
+                        action_feedback = f"\n[⏰ Reminder set for Task #{task_id} at {time_str}]"
+                        logger.info(f"Reminder set for task {task_id} at {time_str}")
                     else:
-                        action_feedback = f"\n[⏰ Reminder set for Task #{action['task_id']} at {reminder_time}]"
-                    logger.info(f"Set reminder for task {action['task_id']} at {reminder_time}")
+                        action_feedback = f"\n[⏰ Reminder set for Task #{task_id} at {reminder_time}]"
+                        logger.info(f"Special reminder set for task {task_id}: {reminder_time}")
                 else:
-                    action_feedback = f"\n[❌ Failed to set reminder for Task #{action['task_id']} - invalid time format]"
-                    logger.warning(f"Failed to parse reminder time: {action['details']}")
+                    action_feedback = f"\n[❌ Failed to set reminder for Task #{task_id} - invalid time format]"
+                    logger.error(f"Failed to parse reminder time for task {task_id}: {action['details']}")
+                    
             elif action['type'] == 'help':
-                update_task_status(action['task_id'], 'half-completed', datetime.utcnow())
-                action_feedback = f"\n[📝 Task #{action['task_id']} has been marked as in-progress]"
-                logger.info(f"Marked task {action['task_id']} as in-progress")
+                task_id = action['task_id']
+                update_task_status(task_id, 'half-completed', datetime.utcnow())
+                action_feedback = f"\n[📝 Task #{task_id} has been marked as in-progress]"
+                logger.info(f"Task {task_id} marked as in-progress. Help requested: {action['details']}")
+                
+            elif action['type'] == 'notes':
+                task_id = action['task_id']
+                await self.add_task_notes(task_id, action['details'])
+                action_feedback = f"\n[📝 Added note to Task #{task_id}]"
+                logger.info(f"Added note to task {task_id}: {action['details']}")
+            
             elif action['type'] == 'draft_email':
+                task_id = action['task_id']
                 try:
                     if isinstance(action['details'], str):
                         details_str = action['details'].strip()
@@ -1019,21 +1153,65 @@ class AIAgent:
                     else:
                         email_details = action['details']
                     
-                    draft = await self._draft_email(action['task_id'], email_details)
+                    draft = await self._draft_email(task_id, email_details)
                     response = re.sub(
                         r'\[ACTION:draft_email:[^\]]*\]',
                         f"\nHere's a draft email for you:\n\n{draft}",
                         response
                     )
-                    action_feedback = f"\n[📧 Email draft created for Task #{action['task_id']}]"
-                    logger.info(f"Created email draft for task {action['task_id']}")
+                    action_feedback = f"\n[📧 Email draft created for Task #{task_id}]"
+                    logger.info(f"Email draft created for task {task_id}. Recipients: {email_details.get('to', 'Not specified')}")
                 except (json.JSONDecodeError, TypeError) as e:
-                    logger.error(f"Invalid email details format: {e}")
+                    logger.error(f"Invalid email details format for task {task_id}: {e}")
                     response = re.sub(r'\[ACTION:draft_email:[^\]]*\]', '', response)
                     action_feedback = f"\n[❌ Failed to create email draft - invalid format]"
+                    
+            elif action['type'] == 'profile':
+                try:
+                    # Handle different profile action subtypes
+                    if action['details'].startswith('{'):
+                        details = json.loads(action['details'])
+                    else:
+                        details = {'value': action['details']}
+                    
+                    profile_manager = ProfileManager()
+                    if 'update' in action['subtype']:
+                        # Update profile with new information
+                        profile, insight = await profile_manager.process_input(
+                            json.dumps(details),
+                            is_direct_input=False
+                        )
+                        if insight:
+                            action_feedback = f"\n[👤 Profile updated: {insight}]"
+                            logger.info(f"Profile updated with new insight: {insight}")
+                        else:
+                            action_feedback = "\n[👤 Profile updated]"
+                            logger.info("Profile updated without new insights")
+                    elif 'preference' in action['subtype']:
+                        # Add user preference
+                        profile, insight = await profile_manager.process_input(
+                            f"User preference: {json.dumps(details)}",
+                            is_direct_input=False
+                        )
+                        action_feedback = f"\n[👤 Added preference to profile]"
+                        logger.info(f"Added user preference to profile: {details}")
+                    elif 'goal' in action['subtype']:
+                        # Add user goal
+                        profile, insight = await profile_manager.process_input(
+                            f"User goal: {json.dumps(details)}",
+                            is_direct_input=False
+                        )
+                        action_feedback = f"\n[👤 Added goal to profile]"
+                        logger.info(f"Added user goal to profile: {details}")
+                    
+                except Exception as e:
+                    logger.error(f"Error handling profile action: {str(e)}")
+                    action_feedback = "\n[❌ Failed to update profile]"
+                    
             elif action['type'] == 'explore':
-                action_feedback = f"\n[🔍 Exploring details for Item #{action['task_id']}]"
-                logger.info(f"Exploring item {action['task_id']}")
+                task_id = action['task_id']
+                action_feedback = f"\n[🔍 Exploring details for Item #{task_id}]"
+                logger.info(f"Exploring item {task_id}. Details: {action['details']}")
             
             # Remove any remaining action directives from the response
             response = re.sub(r'\[ACTION:[^\]]*\]', '', response).strip()
@@ -1041,6 +1219,7 @@ class AIAgent:
             # Add action feedback if available
             if action_feedback:
                 response += action_feedback
+                logger.info(f"Action completed successfully: {action['type']}")
             
             return response
             
