@@ -86,5 +86,5 @@ TEMPERATURE = float(get_optional_env("TEMPERATURE", "0.7"))
 MAX_TOKENS = int(get_optional_env("MAX_TOKENS", "1000"))  # Maximum tokens per task chunk
 MAX_EMAILS = int(get_optional_env("MAX_EMAILS", "5"))  # Maximum emails/tasks per chunk
 URGENCY_ORDER = [5, 4, 3, 2, 1]  # Process tasks in order of urgency (5 highest)
-HALF_FINISHED_PRIORITY = 4  # Priority level for half-finished tasks
+HALF_FINISHED_PRIORITY = 3  # Priority level for half-finished tasks
 HIGH_PRIORITY_URGENCY_LEVELS = [5, 4, 3]  # Urgency levels considered high priority for task summaries 

@@ -1,17 +1,20 @@
 """
 Main AI agent implementation coordinating between different models and tasks.
 """
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, AsyncGenerator
 import logging
 from datetime import datetime, timedelta
+import json
+import re
 
 from chatgpt_agent import ChatGPTAgent
 from o3_mini import O3MiniAgent
-from database import SessionLocal, Conversation, AgentTask, Task, get_tasks_by_urgency, update_task_status
+from database import SessionLocal, Conversation, AgentTask, Task, get_tasks_by_urgency, update_task_status, get_task_by_id, update_task_urgency, append_task_notes, create_task, update_task_description
 from config import (
     MAX_RETRIES, TIMEOUT, MAX_TOKENS, MAX_EMAILS,
     URGENCY_ORDER, HALF_FINISHED_PRIORITY
 )
+from profile_manager import ProfileManager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -34,7 +37,7 @@ class AIAgent:
         if not self.o3_mini.is_available:
             logger.warning("O3-mini model is not available")
 
-    async def process_input(self, user_input: str, context: Optional[Dict[str, Any]] = None) -> str:
+    async def process_input(self, user_input: str, context: Optional[Dict[str, Any]] = None) -> AsyncGenerator[str, None]:
         """
         Process user input and return the appropriate response.
         
@@ -45,24 +48,86 @@ class AIAgent:
                     - is_greeting: True if this is the initial greeting
                     - has_tasks: Whether there are any tasks
                     - task_count: Number of current tasks
+                    - tasks: List of available tasks
                     - history: List of previous message exchanges
+                    - current_task_id: ID of the task currently being discussed
+                    - profile: User profile information
         
         Returns:
-            str: The agent's response
+            AsyncGenerator[str, None]: The agent's response chunks
         
         Raises:
             RuntimeError: If no models are available
         """
         if not self.chatgpt.is_available and not self.o3_mini.is_available:
-            raise RuntimeError(
-                "No AI models are available. Please check your API keys in the .env file."
-            )
+            raise RuntimeError("No AI models are available.")
 
         try:
-            # Log the incoming request
-            logger.info(f"Processing user input: {user_input[:100]}...")
+            # Process input for profile insights first
+            learned_something = False
+            profile_insight = None
+            if not context.get('is_greeting'):  # Skip profile processing for greetings
+                profile_manager = ProfileManager()
+                profile, insight = await profile_manager.process_input(user_input, is_direct_input=False)
+                if insight:
+                    # Update context with new profile information
+                    if context is None:
+                        context = {}
+                    context['profile'] = profile
+                    logger.info(f"Updated user profile from conversation: {insight}")
+                    learned_something = True
+                    profile_insight = insight
 
-            # Create a new task
+            # If this is a greeting, create a special prompt
+            if context and context.get('is_greeting'):
+                items = context.get('tasks', [])
+                task_count = len([i for i in items if i.get('type', 'task') == 'task'])
+                info_count = len([i for i in items if i.get('type') != 'task'])
+                
+                greeting_prompt = f"""You are a helpful AI assistant with access to both tasks and interesting information/opportunities.
+
+                Current status:
+                - Tasks: {task_count} active tasks
+                - Information/Opportunities: {info_count} items
+                
+                Available items:
+                {self._format_tasks_for_ai(items)}
+                
+                Create a warm, friendly greeting that:
+                1. Acknowledges both tasks and information/opportunities
+                2. Mentions the number of tasks that need attention
+                3. Hints at interesting opportunities if any exist
+                4. Suggests what we should focus on first, considering:
+                   - Task urgency and deadlines
+                   - Task complexity and dependencies
+                   - User's recent activity (if any in conversation history)
+                   - Balance between tasks and opportunities
+                5. Keeps it concise and conversational
+                6. Avoids mentioning specific commands
+                7. Makes it clear you can help with both urgent tasks and exploring interesting opportunities
+                
+                Make it feel like a natural conversation starter with a helpful colleague who knows what needs attention."""
+                
+                async for chunk in self.chatgpt.process(greeting_prompt, {
+                    "role": "greeter",
+                    "style": "warm",
+                    "focus": "welcoming",
+                    "history": context.get('history', [])
+                }):
+                    yield chunk
+                return
+
+            # For everything else, process naturally with task context
+            if context and 'tasks' in context:
+                async for chunk in self.handle_task_input(user_input, context['tasks'], context):
+                    yield chunk
+                
+                # If we learned something about the user, mention it naturally
+                if learned_something and profile_insight:
+                    yield f"\n\nBy the way, I noticed something about you, and saved it to my memory to improve our interactions: {profile_insight}"
+                return
+
+            # Create a new conversation entry
             task = AgentTask(
                 task_type="process_input",
                 status="in_progress"
@@ -81,13 +146,19 @@ class AIAgent:
                 if use_o3_mini:
                     async for chunk in self.o3_mini.process(user_input, context):
                         response_chunks.append(chunk)
+                        yield chunk
                     model_used = "o3-mini"
                 else:
                     if not self.chatgpt.is_available:
                         raise RuntimeError("ChatGPT is not available and this input requires it")
                     async for chunk in self.chatgpt.process(user_input, context):
                         response_chunks.append(chunk)
+                        yield chunk
                     model_used = "gpt-4"
+
+                # If we learned something about the user, mention it naturally after the response
+                if learned_something and profile_insight:
+                    yield f"\n\nBy the way, I noticed something about you: {profile_insight}"
 
             except Exception as model_error:
                 # If primary model fails, try fallback to the other model
@@ -97,14 +168,20 @@ class AIAgent:
                     logger.info("Falling back to ChatGPT")
                     async for chunk in self.chatgpt.process(user_input, context):
                         response_chunks.append(chunk)
+                        yield chunk
                     model_used = "gpt-4"
                 elif not use_o3_mini and self.o3_mini.is_available:
                     logger.info("Falling back to O3-mini")
                     async for chunk in self.o3_mini.process(user_input, context):
                         response_chunks.append(chunk)
+                        yield chunk
                     model_used = "o3-mini"
                 else:
                     raise
+
+                # If we learned something about the user, mention it naturally after the fallback response
+                if learned_something and profile_insight:
+                    yield f"\n\nBy the way, I noticed something about you: {profile_insight}"
 
             response = "".join(response_chunks)
 
@@ -121,14 +198,8 @@ class AIAgent:
             task.result = response
             self.db.commit()
 
-            return response
-
         except Exception as e:
             logger.error(f"Error processing input: {str(e)}")
-            if task:
-                task.status = "failed"
-                task.result = str(e)
-                self.db.commit()
             raise
 
     def _requires_deep_thinking(self, input_text: str) -> bool:
@@ -146,49 +217,57 @@ class AIAgent:
         deep_thinking_keywords = {'analyze', 'compare', 'evaluate', 'synthesize'}
         return any(keyword in input_text.lower() for keyword in deep_thinking_keywords)
 
-    async def process_tasks(self) -> List[dict]:
+    async def get_task_count(self) -> int:
         """
-        Main task processing loop that:
-        1. Loads tasks by urgency
-        2. Chunks them appropriately
-        3. Gets summaries and presents them
-        4. Returns the list of tasks for further interaction
+        Get the total count of active tasks.
         
         Returns:
-            List[dict]: List of all processed tasks
+            int: The number of active tasks
         """
         try:
-            # Get all tasks ordered by urgency
-            all_tasks = []
+            count = 0
             for urgency in URGENCY_ORDER:
                 tasks = get_tasks_by_urgency(urgency)
-                all_tasks.extend(tasks)
+                if tasks:
+                    count += len(tasks)
+                
+                # Include half-finished tasks in the count
+                if urgency == HALF_FINISHED_PRIORITY:
+                    half_finished = [t for t in tasks if t.get('status') == 'half-completed']
+                    count += len(half_finished)
+            
+            return count
+            
+        except Exception as e:
+            logger.error(f"Error getting task count: {str(e)}")
+            raise
+
+    async def get_tasks(self) -> List[dict]:
+        """
+        Retrieve all tasks and information items ordered by urgency.
+        
+        Returns:
+            List[dict]: List of all tasks and information items
+        """
+        try:
+            all_items = []
+            for urgency in URGENCY_ORDER:
+                items = get_tasks_by_urgency(urgency)
+                if items:  # Only extend if we got items
+                    # Filter out completed tasks
+                    active_items = [item for item in items if item.get('status') != 'completed']
+                    all_items.extend(active_items)
 
                 # Handle half-finished tasks with special priority
                 if urgency == HALF_FINISHED_PRIORITY:
-                    half_finished = [t for t in tasks if t['status'] == 'half-completed']
-                    all_tasks.extend(half_finished)
+                    half_finished = [t for t in items if t.get('status') == 'half-completed']
+                    if half_finished:
+                        all_items.extend(half_finished)
 
-            if not all_tasks:
-                print("No tasks available.")
-                return []
-
-            # Chunk tasks for processing
-            task_chunks = self._chunk_tasks(all_tasks)
-            
-            for i, chunk in enumerate(task_chunks, 1):
-                print(f"\nTask Group {i}:")
-                # Get summary from ChatGPT
-                chunk_text = self._format_tasks_for_summary(chunk)
-                summary = ""
-                async for chunk in self.chatgpt.summarize_tasks(chunk_text):
-                    summary += chunk
-                print(summary)
-
-            return all_tasks
+            return all_items
 
         except Exception as e:
-            logger.error(f"Error in task processing: {str(e)}")
+            logger.error(f"Error retrieving tasks: {str(e)}")
             raise
 
     def _chunk_tasks(self, tasks: List[dict]) -> List[List[dict]]:
@@ -224,96 +303,502 @@ class AIAgent:
 
         return chunks
 
-    def _format_tasks_for_summary(self, tasks: List[dict]) -> str:
+    async def present_tasks(self, tasks: List[dict]) -> str:
         """
-        Format a list of tasks into a string for summarization.
+        Have the AI present the tasks in a conversational way.
         
         Args:
             tasks: List of task dictionaries
         
         Returns:
-            Formatted string of tasks
+            str: The AI's conversational presentation of the tasks
         """
-        formatted_tasks = []
-        for task in tasks:
-            task_str = f"Task {task['id']}: {task['description']}\n"
-            task_str += f"Urgency: {task['urgency']}\n"
-            task_str += f"Status: {task['status']}\n"
-            if task.get('alertAt'):
-                task_str += f"Alert At: {task['alertAt']}\n"
-            formatted_tasks.append(task_str)
-        
-        return "\n".join(formatted_tasks)
+        try:
+            # Group tasks by urgency
+            tasks_by_urgency = {}
+            half_finished = []
+            
+            for task in tasks:
+                urgency = task.get('urgency', 0)
+                status = task.get('status', '')
+                
+                if status == 'half-completed':
+                    half_finished.append(task)
+                else:
+                    if urgency not in tasks_by_urgency:
+                        tasks_by_urgency[urgency] = []
+                    tasks_by_urgency[urgency].append(task)
+            
+            # Create a natural introduction
+            prompt = """You are a friendly, helpful AI assistant. Present the most urgent tasks in a casual, 
+            conversational way. Don't list everything at once - just give a quick overview of what needs attention,
+            focusing mainly on urgency level 5 tasks and any half-finished tasks.
+            
+            Be brief but engaging. After mentioning the most urgent items, ask if the user would like to:
+            1. Look at any specific task in more detail
+            2. See more tasks
+            3. Get help prioritizing
+            
+            Make it feel like a natural conversation with a helpful colleague.
+            
+            Current tasks by urgency:
+            """
+            
+            # Add urgency 5 tasks first
+            if 5 in tasks_by_urgency:
+                prompt += "\nUrgency 5 (Most urgent):\n"
+                for task in tasks_by_urgency[5]:
+                    prompt += f"[Task #{task.get('id')}]: {task.get('description')}\n"
+            
+            # Add half-finished tasks
+            if half_finished:
+                prompt += "\nHalf-finished tasks:\n"
+                for task in half_finished:
+                    prompt += f"[Task #{task.get('id')}]: {task.get('description')} (Status: In progress)\n"
+            
+            # Add a note about other tasks
+            other_count = sum(len(tasks) for urgency, tasks in tasks_by_urgency.items() if urgency < 5)
+            if other_count > 0:
+                prompt += f"\nThere are also {other_count} other tasks with lower urgency levels that we can look at later.\n"
+            
+            # Get the AI's response
+            response = ""
+            async for chunk in self.chatgpt.process(prompt, {
+                "role": "task_presenter",
+                "style": "conversational",
+                "focus": "high_priority"
+            }):
+                response += chunk
+            
+            return response
 
-    async def process_selected_task(self, task_id: int) -> None:
+        except Exception as e:
+            logger.error(f"Error presenting tasks: {str(e)}")
+            raise
+
+    def _format_tasks_for_ai(self, items: List[dict]) -> str:
+        """
+        Format tasks and information items for AI consumption.
+        
+        Args:
+            items: List of tasks and information items
+            
+        Returns:
+            str: Formatted string of items
+        """
+        formatted = []
+        
+        # Group items by type
+        tasks = [i for i in items if i.get('type', 'task') == 'task']
+        info_items = [i for i in items if i.get('type') == 'info']
+        
+        # Format tasks
+        if tasks:
+            formatted.append("Tasks:")
+            for task in tasks:
+                task_str = f"[Task #{task['id']}]: {task['description']}"
+                if task.get('urgency'):
+                    task_str += f" (Urgency: {task['urgency']})"
+                if task.get('status'):
+                    task_str += f" - {task['status']}"
+                if task.get('notes'):
+                    task_str += f"\n  Notes: {task['notes']}"
+                formatted.append(task_str)
+        
+        # Format information items
+        if info_items:
+            if tasks:  # Add a blank line if we had tasks
+                formatted.append("")
+            formatted.append("Interesting Information:")
+            for item in info_items:
+                info_str = f"[Info #{item['id']}]: {item['description']}"
+                if item.get('source'):
+                    info_str += f"\n  Source: {item['source']}"
+                if item.get('notes'):
+                    info_str += f"\n  Notes: {item['notes']}"
+                formatted.append(info_str)
+        
+        if not formatted:
+            return "No items available."
+            
+        return "\n".join(formatted)
+
+    async def process_selected_task(self, task_id: int) -> AsyncGenerator[str, None]:
         """
         Process a selected task by generating an action prompt and handling user interaction.
         
         Args:
             task_id: The ID of the task to process
             
+        Returns:
+            AsyncGenerator[str, None]: The AI's response chunks
+            
         Raises:
             ValueError: If the task is not found
         """
         try:
             # Get the task from the database
-            task = self.db.query(Task).filter(Task.id == task_id).first()
+            task = get_task_by_id(task_id)
             if not task:
                 raise ValueError(f"Task {task_id} not found")
 
-            # Convert task to dictionary for the action prompt
-            task_dict = {
-                'id': task.id,
-                'description': task.description,
-                'urgency': task.urgency,
-                'deadline': task.deadline.isoformat() if task.deadline else None,
-                'category': task.category,
-                'status': task.status
-            }
+            # Create a conversational prompt about this task
+            task_prompt = f"""You are a helpful AI assistant discussing a specific task with the user.
+            Be engaging and supportive, like a colleague helping to tackle a challenge together.
+            
+            Current task:
+            [Task #{task.get('id')}]: {task.get('description')}
+            Urgency: {task.get('urgency')}
+            Status: {task.get('status')}
+            
+            First, briefly explain why this task is important or exciting, and what impact it might have.
+            Then, offer to:
+            1. Help break it down into smaller steps
+            2. Set a reminder for later
+            3. Provide specific assistance or guidance
+            4. Mark it as complete if it's done
+            
+            Make it conversational and encouraging, but keep it concise."""
 
-            # Generate and display action prompt
-            prompt = ""
-            async for chunk in self.chatgpt.generate_action_prompt(task_dict):
-                prompt += chunk
-            print("\n" + prompt)
+            # Get the AI's response
+            response = ""
+            print("\nAI: ", end="", flush=True)
+            async for chunk in self.chatgpt.process(task_prompt, {
+                "role": "task_helper",
+                "style": "supportive",
+                "focus": "action_oriented"
+            }):
+                response += chunk
+                print(chunk, end="", flush=True)
+            print()  # Add a newline after streaming
 
             while True:
-                action = input("\nYour action (complete/remind/help/skip/back): ").strip().lower()
+                print("\nWhat would you like to do? You can:")
+                print("1. Get help breaking it down")
+                print("2. Set a reminder")
+                print("3. Mark as complete")
+                print("4. Get specific assistance")
+                print("5. Go back to task list")
                 
-                if action == 'back':
+                action = input("\nYour choice (1-5): ").strip()
+                
+                if action == "5":
                     break
-                elif action == 'complete':
-                    update_task_status(task_id, 'completed', None)
-                    print(f"Task {task_id} marked as completed.")
-                    break
-                elif action == 'remind':
-                    # Set reminder for tomorrow
-                    reminder_time = datetime.utcnow() + timedelta(days=1)
-                    update_task_status(task_id, task.status, reminder_time)
-                    print(f"Reminder set for task {task_id} for tomorrow.")
-                    break
-                elif action == 'help':
-                    update_task_status(task_id, 'half-completed', datetime.utcnow())
-                    print(f"Task {task_id} marked as needing help. I'll help you break it down.")
+                elif action == "1":
+                    # Help break down the task
+                    breakdown_prompt = f"Help break down this task into manageable steps: {task.get('description')}"
+                    breakdown = ""
+                    print("\nAI: ", end="", flush=True)
+                    async for chunk in self.chatgpt.process(breakdown_prompt, {
+                        "role": "task_breakdown",
+                        "style": "helpful",
+                        "focus": "actionable_steps"
+                    }):
+                        breakdown += chunk
+                        print(chunk, end="", flush=True)
+                    print()  # Add a newline after streaming
                     
-                    # Generate help response
-                    help_response = ""
-                    async for chunk in self.chatgpt.process(
-                        f"Help me break down this task: {task.description}",
-                        context={'task_id': task_id}
-                    ):
-                        help_response += chunk
-                    print("\n" + help_response)
+                    # Mark as half-completed
+                    update_task_status(task_id, 'half-completed', datetime.utcnow())
+                    print("\nAI: I've marked this task as in progress. We can come back to it anytime.")
                     break
-                elif action == 'skip':
-                    print(f"Skipping task {task_id}.")
+                    
+                elif action == "2":
+                    print("\nWhen would you like to be reminded? (Examples: '2h' for 2 hours, '3d' for 3 days, or enter a specific date/time)")
+                    reminder_input = input("Reminder time: ").strip().lower()
+                    
+                    # Parse the reminder time
+                    try:
+                        if reminder_input.endswith('h'):
+                            hours = int(reminder_input[:-1])
+                            reminder_time = datetime.utcnow() + timedelta(hours=hours)
+                        elif reminder_input.endswith('d'):
+                            days = int(reminder_input[:-1])
+                            reminder_time = datetime.utcnow() + timedelta(days=days)
+                        elif reminder_input == "next debrief":
+                            reminder_time = "next_debrief"
+                        else:
+                            # Try to parse as datetime
+                            reminder_time = datetime.strptime(reminder_input, "%Y-%m-%d %H:%M")
+                        
+                        update_task_status(task_id, task.get('status'), reminder_time)
+                        print(f"\nAI: I'll remind you about this task at the specified time.")
+                        break
+                    except ValueError:
+                        print("\nAI: I didn't understand that time format. Please try again.")
+                        continue
+                    
+                elif action == "3":
+                    update_task_status(task_id, 'completed', None)
+                    print("\nAI: Great job! I've marked this task as completed. Is there anything else you'd like to look at?")
                     break
+                    
+                elif action == "4":
+                    # Get specific assistance
+                    print("\nWhat specific aspect would you like help with?")
+                    aspect = input("Your focus: ").strip()
+                    
+                    # Use deep thinking for complex assistance
+                    if self._requires_deep_thinking(aspect):
+                        print("\nAI: This seems like it needs some careful thought. Would you like me to analyze this deeply? (y/n)")
+                        if input().strip().lower() == 'y':
+                            response = ""
+                            print("\nAI: ", end="", flush=True)
+                            async for chunk in self.o3_mini.think_deep(
+                                f"Help with this specific aspect of the task: {aspect}\nTask context: {task.get('description')}"
+                            ):
+                                response += chunk
+                                print(chunk, end="", flush=True)
+                            print()  # Add a newline after streaming
+                    else:
+                        assistance = ""
+                        print("\nAI: ", end="", flush=True)
+                        async for chunk in self.chatgpt.process(
+                            f"Provide specific help with this aspect: {aspect}\nTask context: {task.get('description')}",
+                            {"role": "specific_helper"}
+                        ):
+                            assistance += chunk
+                            print(chunk, end="", flush=True)
+                        print()  # Add a newline after streaming
+                    continue
+                    
                 else:
-                    print("Invalid action. Available actions: complete, remind, help, skip, back")
+                    print("\nAI: I didn't catch that. Please choose a number between 1 and 5.")
+                    continue
+
+            # Yield any changes from action processing
+            yield "\n" + response.replace(response, "").strip()
 
         except Exception as e:
             logger.error(f"Error processing selected task: {str(e)}")
             raise
+
+    async def update_task_priority(self, task_id: int, new_urgency: int, reason: str) -> None:
+        """
+        Update a task's urgency level and add a note explaining why.
+        
+        Args:
+            task_id: The ID of the task to update
+            new_urgency: The new urgency level (1-5)
+            reason: The reason for the urgency change
+            
+        Raises:
+            ValueError: If the task is not found or urgency is invalid
+        """
+        try:
+            # First verify the task exists
+            task = get_task_by_id(task_id)
+            if not task:
+                raise ValueError(f"Task {task_id} not found")
+
+            # Update the urgency
+            update_task_urgency(task_id, new_urgency)
+            
+            # Add a note about the change
+            note = f"Urgency changed from {task['urgency']} to {new_urgency}. Reason: {reason}"
+            append_task_notes(task_id, note)
+            
+            logger.info(f"Updated urgency for task {task_id} to {new_urgency}")
+            
+        except Exception as e:
+            logger.error(f"Error updating task priority: {str(e)}")
+            raise
+
+    async def add_task_notes(self, task_id: int, notes: str) -> None:
+        """
+        Add additional notes to a task.
+        
+        Args:
+            task_id: The ID of the task
+            notes: The notes to add
+            
+        Raises:
+            ValueError: If the task is not found
+        """
+        try:
+            if not get_task_by_id(task_id):
+                raise ValueError(f"Task {task_id} not found")
+                
+            append_task_notes(task_id, notes)
+            logger.info(f"Added notes to task {task_id}")
+            
+        except Exception as e:
+            logger.error(f"Error adding task notes: {str(e)}")
+            raise
+
+    async def create_new_task(self, description: str, urgency: int, alert_at: Optional[datetime] = None) -> int:
+        """
+        Create a new task in the system.
+        
+        Args:
+            description: The task description
+            urgency: The urgency level (1-5)
+            alert_at: Optional datetime for when to alert about this task
+            
+        Returns:
+            int: The ID of the newly created task
+            
+        Raises:
+            ValueError: If urgency is invalid
+        """
+        try:
+            task_id = create_task(description, urgency, alert_at=alert_at)
+            logger.info(f"Created new task with ID {task_id}")
+            return task_id
+            
+        except Exception as e:
+            logger.error(f"Error creating new task: {str(e)}")
+            raise
+
+    async def _identify_task_modification(self, user_input: str, task_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Analyze user input to identify task modifications.
+        
+        Args:
+            user_input: The user's input text
+            task_id: The ID of the current task being discussed
+            
+        Returns:
+            Optional[Dict[str, Any]]: Modification details if identified, None otherwise
+            The dictionary contains:
+            - type: The type of modification ('urgency', 'status', 'notes', 'description', 'reminder')
+            - value: The new value to set
+            - reason: The reason for the change (if applicable)
+            - task_id: The ID of the task to modify
+        """
+        # Get the current task
+        task = get_task_by_id(task_id)
+        if not task:
+            logger.warning(f"Task {task_id} not found during modification analysis")
+            return None
+
+        try:
+            # Use ChatGPT to analyze the input for modifications
+            analysis_prompt = f"""Analyze this user input for task modifications:
+            Task ID: {task_id}
+            Current Task Status: {task.get('status', 'unknown')}
+            Current Urgency: {task.get('urgency', 0)}
+            User Input: {user_input}
+
+            If this input suggests any task modifications, format them as JSON:
+            {{
+                "type": "urgency|status|notes|description|reminder",
+                "value": "the new value",
+                "reason": "reason for change",
+                "task_id": {task_id}
+            }}
+            
+            Important: For description modifications, you can ONLY APPEND information. Never suggest replacing or removing existing description content.
+            If you need to indicate that some part of the description is no longer accurate or relevant, append a note explaining what's incorrect or outdated.
+            
+            Examples:
+            - "this is urgent" -> {{"type": "urgency", "value": "5", "reason": "User indicated high urgency", "task_id": {task_id}}}
+            - "mark as done" -> {{"type": "status", "value": "completed", "reason": "User requested completion", "task_id": {task_id}}}
+            - "remind me tomorrow" -> {{"type": "reminder", "value": "2024-02-23T09:00:00", "reason": "User requested tomorrow reminder", "task_id": {task_id}}}
+            - "the deadline changed to next week" -> {{"type": "description", "value": "Update: Previous deadline is no longer accurate. New deadline is next week.", "reason": "User indicated deadline change", "task_id": {task_id}}}
+
+            The user's requests for these modifications may also be implicit.
+            They may off-handedly mention something connected to the task, which should be appended to the task description.
+            They may talk in a more urgent tone about the task, which may also be a modification.
+            If no modifications are suggested, respond with "null".
+            """
+
+            modification_json = ""
+            async for chunk in self.chatgpt.process(analysis_prompt, {"system_role": "task_analyzer"}):
+                modification_json += chunk
+
+            # Parse the response
+            try:
+                modification = json.loads(modification_json.strip())
+                if modification:
+                    logger.info(f"Identified task modification: {modification}")
+                    # Ensure task_id is included
+                    modification['task_id'] = task_id
+                    return modification
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse modification JSON: {e}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error identifying task modification: {str(e)}")
+            return None
+
+        return None
+
+    async def _apply_task_modification(self, modification: Dict[str, Any]) -> Optional[str]:
+        """
+        Apply identified task modifications and generate a response.
+        
+        Args:
+            modification: The modification details from _identify_task_modification
+            
+        Returns:
+            Optional[str]: A response describing the modification, or None if no modification was made
+        """
+        try:
+            task_id = modification.get('task_id')
+            mod_type = modification.get('type')
+            value = modification.get('value')
+            reason = modification.get('reason', 'No reason provided')
+
+            if not all([task_id, mod_type, value]):
+                logger.warning("Missing required modification fields")
+                return None
+
+            # Verify task exists
+            task = get_task_by_id(task_id)
+            if not task:
+                logger.warning(f"Task {task_id} not found during modification")
+                return None
+
+            response = None
+            if mod_type == 'urgency':
+                try:
+                    urgency = int(value)
+                    if 1 <= urgency <= 5:
+                        await self.update_task_priority(task_id, urgency, reason)
+                        response = f"I've updated the task urgency to {urgency}. {reason}"
+                    else:
+                        logger.warning(f"Invalid urgency value: {urgency}")
+                except ValueError:
+                    logger.warning(f"Failed to convert urgency value: {value}")
+            
+            elif mod_type == 'status':
+                valid_statuses = {'pending', 'completed', 'half-completed'}
+                if value in valid_statuses:
+                    update_task_status(task_id, value, None)
+                    response = f"I've marked the task as {value}. {reason}"
+                else:
+                    logger.warning(f"Invalid status value: {value}")
+            
+            elif mod_type == 'notes' or mod_type == 'description':  # Handle both notes and description as appends
+                if value.strip():
+                    await self.add_task_notes(task_id, value)
+                    response = f"I've added this information to the task: {value}"
+                else:
+                    logger.warning("Empty notes/description value")
+            
+            elif mod_type == 'reminder':
+                try:
+                    from datetime import datetime
+                    alert_time = datetime.fromisoformat(value)
+                    update_task_status(task_id, task.get('status', 'pending'), alert_time)
+                    response = f"I've set a reminder for {alert_time.strftime('%Y-%m-%d %H:%M')}. {reason}"
+                except ValueError as e:
+                    logger.warning(f"Invalid datetime format: {e}")
+            else:
+                logger.warning(f"Unknown modification type: {mod_type}")
+
+            if response:
+                logger.info(f"Applied task modification: {mod_type} to task {task_id}")
+                return response
+            else:
+                logger.warning(f"Failed to apply modification: {modification}")
+
+        except Exception as e:
+            logger.error(f"Error applying task modification: {str(e)}")
+            
+        return None
 
     def __del__(self):
         """Cleanup resources."""
@@ -321,4 +806,298 @@ class AIAgent:
             try:
                 self.db.close()
             except Exception as e:
-                logger.error(f"Error closing database connection: {str(e)}") 
+                logger.error(f"Error closing database connection: {str(e)}")
+
+    async def handle_task_input(self, user_input: str, available_items: List[dict], context: Optional[Dict[str, Any]] = None) -> AsyncGenerator[str, None]:
+        """
+        Handle natural language input about tasks and information items.
+        
+        Args:
+            user_input: The user's input text
+            available_items: List of available tasks and information items
+            context: Optional context dictionary including conversation history
+            
+        Returns:
+            AsyncGenerator[str, None]: The AI's response chunks
+        """
+        try:
+            # Update context with current item if we're discussing one
+            current_item = None
+            if context and 'current_task_id' in context:
+                current_item = next(
+                    (i for i in available_items if i.get('id') == context['current_task_id']),
+                    None
+                )
+
+            # Check if input is an item ID first
+            if user_input.isdigit():
+                item_id = int(user_input)
+                item = next((i for i in available_items if i.get('id') == item_id), None)
+                if item:
+                    # Update context to focus on this item
+                    if context is not None:
+                        context['current_task_id'] = item_id
+                    async for chunk in self._discuss_specific_item(item):
+                        yield chunk
+                    return
+                yield "I couldn't find that item. Could you try another one or describe what you're interested in?"
+                return
+            
+            # Format conversation history for the prompt
+            conversation_context = ""
+            if context and 'history' in context:
+                # Get last few exchanges for context
+                recent_history = context['history'][-6:]  # Last 3 exchanges (6 messages)
+                if recent_history:
+                    conversation_context = "\nRecent conversation:\n"
+                    for msg in recent_history:
+                        role = "User" if msg['role'] == 'user' else "AI"
+                        conversation_context += f"{role}: {msg['content']}\n"
+            
+            # Create a prompt for the AI to understand and respond to the input
+            prompt = f"""You are a helpful AI assistant discussing both tasks and interesting information/opportunities. The user has just said: "{user_input}"
+
+            {conversation_context}
+
+            Current context:
+            {f'We are currently discussing {"Task" if current_item.get("type", "task") == "task" else "Info"} #{current_item["id"]}: {current_item["description"]}' if current_item else 'No specific item in focus'}
+
+            Available items:
+            {self._format_tasks_for_ai(available_items)}
+
+            Based on what the user said and our conversation history:
+            1. Remember previous context and maintain conversation continuity
+            2. If they mentioned completing a task, mark it as complete
+            3. If they want to set a reminder, use the [ACTION:remind] directive
+            4. If they're asking about the current item, stay focused on it
+            5. If they want more details about an information item, provide them
+            6. If they want to draft an email about a task, help compose it
+            7. If they're asking about task status or progress, provide relevant updates
+            8. If they're expressing interest in an opportunity, explore it with them
+            
+            Be conversational and helpful. If you need to take action, indicate that in your response with [ACTION:action_type:item_id:details].
+            
+            Available actions:
+            [ACTION:complete:123:null] - Mark task as complete
+            [ACTION:remind:456:2h] - Set a reminder (use 24h for tomorrow)
+            [ACTION:help:789:break_down] - Help break down task
+            [ACTION:draft_email:123:{{"subject":"Meeting Follow-up","to":"team@example.com"}}] - Draft an email
+            [ACTION:explore:123:null] - Explore an information item in detail
+            
+            Keep your response natural and friendly, like a helpful colleague.
+            Stay focused on the current item if we're discussing one.
+            
+            If they're asking about finding something easy or interesting:
+            1. Look for tasks with lower urgency (1-2)
+            2. Check for tasks without dependencies
+            3. Consider task complexity from the description
+            4. Look for interesting information items that might energize them
+            5. Suggest the most approachable or engaging item"""
+
+            # Get the AI's response
+            response = ""
+            async for chunk in self.chatgpt.process(prompt, {
+                "role": "task_helper",
+                "style": "conversational",
+                "focus": "context_aware",
+                "current_item": current_item,
+                "history": context.get('history', []) if context else []
+            }):
+                response += chunk
+                yield chunk
+            
+            # Process any actions in the response
+            actions = self._extract_actions(response)
+            for action in actions:
+                # Log the action being processed
+                logger.info(f"Processing action: {action}")
+                action_response = await self._handle_action(action, response)
+                if action_response != response:  # Only update if the action changed something
+                    response = action_response
+                    logger.info("Action processed successfully")
+                    # Yield any changes from action processing
+                    yield "\n" + action_response.replace(response, "").strip()
+
+        except Exception as e:
+            logger.error(f"Error handling input: {str(e)}")
+            raise
+
+    async def _discuss_specific_item(self, item: dict) -> AsyncGenerator[str, None]:
+        """
+        Generate a natural discussion about a specific task or information item.
+        
+        Args:
+            item: The item dictionary
+            
+        Returns:
+            AsyncGenerator[str, None]: The AI's response chunks about the item
+        """
+        is_task = item.get('type', 'task') == 'task'
+        prompt = f"""You are a helpful AI assistant discussing a specific {'task' if is_task else 'information item'}. The item is:
+        [{'Task' if is_task else 'Info'} #{item.get('id')}]: {item.get('description')}
+        {'Urgency: ' + str(item.get('urgency')) if is_task else ''}
+        {'Status: ' + item.get('status', '') if is_task else ''}
+        
+        If this is a task:
+        1. Explain why it's important and what impact it might have
+        2. Suggest ways to help:
+           - Breaking it down into smaller steps
+           - Setting a reminder
+           - Providing specific guidance
+           - Marking it as complete
+        
+        If this is an information item:
+        1. Explain why it's interesting or valuable
+        2. Suggest ways to explore it further:
+           - Related topics to investigate
+           - Potential applications
+           - People who might be interested
+        
+        Be conversational and encouraging, but keep it concise.
+        If they might need deep thinking help, mention that you can analyze it more deeply."""
+
+        async for chunk in self.chatgpt.process(prompt, {
+            "role": "item_discussion",
+            "style": "supportive",
+            "focus": "engagement"
+        }):
+            yield chunk
+
+    def _extract_actions(self, response: str) -> List[dict]:
+        """Extract action directives from the AI's response."""
+        actions = []
+        pattern = r'\[ACTION:(\w+):(\d+):([^\]]*)\]'
+        matches = re.findall(pattern, response)
+        
+        for action_type, task_id, details in matches:
+            actions.append({
+                'type': action_type,
+                'task_id': int(task_id),
+                'details': details
+            })
+        
+        return actions
+
+    async def _handle_action(self, action: dict, response: str) -> str:
+        """Handle an action directive and update the response."""
+        try:
+            action_feedback = None
+            if action['type'] == 'complete':
+                update_task_status(action['task_id'], 'completed', None)
+                action_feedback = f"\n[✓ Task #{action['task_id']} has been marked as completed]"
+                logger.info(f"Completed task {action['task_id']}")
+            elif action['type'] == 'remind':
+                # Handle "tomorrow" in a more natural way
+                if action['details'] == '24h' or action['details'].lower() == 'tomorrow':
+                    reminder_time = datetime.utcnow() + timedelta(days=1)
+                    reminder_time = reminder_time.replace(hour=9, minute=0)  # Set to 9 AM tomorrow
+                else:
+                    reminder_time = self._parse_reminder_time(action['details'])
+                
+                if reminder_time:
+                    update_task_status(action['task_id'], 'pending', reminder_time)
+                    if isinstance(reminder_time, datetime):
+                        time_str = reminder_time.strftime('%Y-%m-%d %H:%M')
+                        action_feedback = f"\n[⏰ Reminder set for Task #{action['task_id']} at {time_str}]"
+                    else:
+                        action_feedback = f"\n[⏰ Reminder set for Task #{action['task_id']} at {reminder_time}]"
+                    logger.info(f"Set reminder for task {action['task_id']} at {reminder_time}")
+                else:
+                    action_feedback = f"\n[❌ Failed to set reminder for Task #{action['task_id']} - invalid time format]"
+                    logger.warning(f"Failed to parse reminder time: {action['details']}")
+            elif action['type'] == 'help':
+                update_task_status(action['task_id'], 'half-completed', datetime.utcnow())
+                action_feedback = f"\n[📝 Task #{action['task_id']} has been marked as in-progress]"
+                logger.info(f"Marked task {action['task_id']} as in-progress")
+            elif action['type'] == 'draft_email':
+                try:
+                    if isinstance(action['details'], str):
+                        details_str = action['details'].strip()
+                        if not details_str.startswith('{'):
+                            details_str = '{' + details_str + '}'
+                        email_details = json.loads(details_str)
+                    else:
+                        email_details = action['details']
+                    
+                    draft = await self._draft_email(action['task_id'], email_details)
+                    response = re.sub(
+                        r'\[ACTION:draft_email:[^\]]*\]',
+                        f"\nHere's a draft email for you:\n\n{draft}",
+                        response
+                    )
+                    action_feedback = f"\n[📧 Email draft created for Task #{action['task_id']}]"
+                    logger.info(f"Created email draft for task {action['task_id']}")
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.error(f"Invalid email details format: {e}")
+                    response = re.sub(r'\[ACTION:draft_email:[^\]]*\]', '', response)
+                    action_feedback = f"\n[❌ Failed to create email draft - invalid format]"
+            elif action['type'] == 'explore':
+                action_feedback = f"\n[🔍 Exploring details for Item #{action['task_id']}]"
+                logger.info(f"Exploring item {action['task_id']}")
+            
+            # Remove any remaining action directives from the response
+            response = re.sub(r'\[ACTION:[^\]]*\]', '', response).strip()
+            
+            # Add action feedback if available
+            if action_feedback:
+                response += action_feedback
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error handling action: {str(e)}")
+            # If there's an error, just return the response without the action directives
+            return re.sub(r'\[ACTION:[^\]]*\]', '', response).strip()
+
+    async def _draft_email(self, task_id: int, details: Dict[str, str]) -> str:
+        """
+        Draft an email related to a task.
+        
+        Args:
+            task_id: The task ID
+            details: Email details including subject and recipients
+            
+        Returns:
+            str: The drafted email
+        """
+        task = get_task_by_id(task_id)
+        if not task:
+            return "Error: Task not found"
+
+        prompt = f"""Draft a professional email about this task:
+        Task: {task.get('description')}
+        Subject: {details.get('subject', 'Task Update')}
+        To: {details.get('to', '[Recipient]')}
+
+        Requirements:
+        1. Keep it concise and professional
+        2. Include key details from the task
+        3. Use appropriate tone for business communication
+        4. Include clear next steps or expectations
+        5. Format with proper email structure (To, Subject, Body)"""
+
+        email = ""
+        async for chunk in self.chatgpt.process(prompt, {
+            "role": "email_drafter",
+            "style": "professional",
+            "focus": "clarity"
+        }):
+            email += chunk
+        
+        return email
+
+    def _parse_reminder_time(self, time_str: str) -> Optional[datetime]:
+        """Parse a reminder time string into a datetime."""
+        try:
+            if time_str == "next_debrief":
+                return "next_debrief"
+            elif time_str.endswith('h'):
+                hours = int(time_str[:-1])
+                return datetime.utcnow() + timedelta(hours=hours)
+            elif time_str.endswith('d'):
+                days = int(time_str[:-1])
+                return datetime.utcnow() + timedelta(days=days)
+            else:
+                return datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+        except:
+            return None 

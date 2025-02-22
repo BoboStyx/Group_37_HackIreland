@@ -65,54 +65,6 @@ class ChatGPTAgent:
             logger.error(f"Error in ChatGPT processing: {str(e)}")
             raise
 
-    async def summarize_tasks(self, task_chunk: str) -> AsyncGenerator[str, None]:
-        """
-        Send a chunk of tasks to ChatGPT-4 and return a summarized rundown.
-        
-        Args:
-            task_chunk (str): A string containing a chunk of tasks to be summarized
-        
-        Returns:
-            AsyncGenerator[str, None]: Summary chunks provided by ChatGPT-4
-        """
-        if not self.is_available:
-            raise RuntimeError("ChatGPT functionality is not available.")
-
-        prompt_template = """Please provide a clear and organized summary of the following tasks.
-        For each task:
-        1. Show the Task ID at the start of each item
-        2. Highlight the urgency level
-        3. Include any deadlines
-        4. Provide a brief but clear description
-        5. Note the current status
-
-        Format the output as a numbered list, ordered by urgency (highest first).
-        Use bullet points for any sub-details.
-        
-        Tasks to summarize:
-        <TASK_CHUNK>"""
-
-        prompt = prompt_template.replace("<TASK_CHUNK>", task_chunk)
-        
-        try:
-            stream = await self.client.chat.completions.create(
-                model=GPT4_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a task management assistant focused on clear and concise summaries."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,  # Lower temperature for more consistent formatting
-                stream=True
-            )
-            
-            async for chunk in stream:
-                if chunk.choices[0].delta.content is not None:
-                    yield chunk.choices[0].delta.content
-
-        except Exception as e:
-            logger.error(f"Error in task summarization: {str(e)}")
-            raise
-
     async def generate_action_prompt(self, task: dict) -> AsyncGenerator[str, None]:
         """
         Generate a prompt explaining the task and asking the user for the next step.
@@ -212,12 +164,12 @@ class ChatGPTAgent:
         - Honest about limitations and uncertainties
 
         When greeting users:
-        - Be direct about the current task status based on the context provided
-        - If has_tasks is false, directly state there are no current tasks
-        - If has_tasks is true, mention the number of tasks (task_count)
+        - If has_tasks is true, mention the number of tasks (task_count) and suggest they can view them by typing 'tasks'
+        - If has_tasks is false, directly state there are no current tasks and offer to help find opportunities
         - Keep greetings brief and focused
         - Never ask about tasks when you have the task status in context
         - Never use emojis or overly casual language
+        - Only mention tasks once in your greeting
 
         When discussing tasks:
         - Show genuine interest in helping users succeed
@@ -226,22 +178,25 @@ class ChatGPTAgent:
         - Offer to think deeply about complex problems
         - Suggest breaking down overwhelming tasks
         - Be proactive about setting reminders
+        - Present tasks in order of urgency
+        - Focus on one task at a time
+        - Let the user drive the conversation pace
 
         When no tasks are present:
         - Directly acknowledge the absence of tasks
-        - Strongly encourage signing up for:
-          * Professional newsletters in their field
-          * Industry group notifications
-          * Relevant opportunity alerts
-          * Curated email digests
-        - Emphasize your role in:
-          * Filtering out time-wasting content
-          * Identifying truly valuable opportunities
-          * Prioritizing information that advances their career/goals
-          * Preventing information overload
-        - Explain that more information sources help you better serve them and that they needn't worry about information overload as you will ensure only the information that directly benefits them reaches them, and will filter out the rest.
-        - Be very clear that while ordinarily these things can clutter an inbox, you will make sure it's actually beneficial
-        - Maintain a professional tone while conveying the importance of staying informed
+        - If profile exists, suggest opportunities based on their interests and goals
+        - Recommend information sources aligned with their professional background
+        - Focus on their specific industry sectors and career aspirations
+        - Maintain a professional tone
+
+        Using profile information:
+        - Always check for 'profile' in the context
+        - Tailor suggestions to their professional background
+        - Consider their stated goals and aspirations
+        - Focus on their preferred types of opportunities
+        - Filter recommendations based on their interests
+        - Reference their skills and competencies when relevant
+        - Respect their content preferences and priorities
 
         Communication style:
         - Use a natural but professional tone
@@ -250,6 +205,7 @@ class ChatGPTAgent:
         - Acknowledge user concerns and preferences
         - Maintain formality while being approachable
         - Never use emojis or excessive punctuation
+        - Never repeat yourself or give redundant prompts
 
         Remember to:
         - Keep track of task context and user preferences
