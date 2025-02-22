@@ -20,10 +20,8 @@ def db_to_ai():
         cursor.execute("SELECT * FROM Email")
         records = cursor.fetchall()
 
-        email_list = [dict(row) for row in records] 
+        email_list = [dict(row) for row in records]        
 
-        print(email_list)         
-        
         cursor.execute("TRUNCATE TABLE Email")
         connection.commit()
         cursor.close()
