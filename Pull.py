@@ -1,27 +1,36 @@
 import mysql.connector
 
-DB_NAME = 'emails_db'
-DB_USER = 'Seyi'
-DB_PASSWORD = 'S1906@duposiDCU'
-DB_HOST = 'localhost'
+def db_to_ai():
+    DB_NAME = 'emails_db'
+    DB_USER = 'Seyi'
+    DB_PASSWORD = 'S1906@duposiDCU'
+    DB_HOST = 'localhost'
 
-try:
-    connection = mysql.connector.connect(
-        host=DB_HOST,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME
-    )
-    cursor = connection.cursor()
+    data = {}
 
-    cursor.execute("SELECT * FROM User")
-    records = cursor.fetchall()
+    try:
+        connection = mysql.connector.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME
+        )
+        cursor = connection.cursor(dictionary=True)  # Correct indentation
 
-    for row in records:
-        print(row)
+        cursor.execute("SELECT * FROM Email")
+        records = cursor.fetchall()
 
-    cursor.close()
-    connection.close()
+        email_list = [dict(row) for row in records] 
 
-except mysql.connector.Error as err:
-    print(f"Error: {err}")
+        print(email_list)         
+        
+        cursor.execute("TRUNCATE TABLE Email")
+        connection.commit()
+        cursor.close()
+        connection.close()
+    except mysql.connector.Error as err:
+        print(f"Error: {err}")
+        return None
+    return email_list
+
+db_to_ai()
