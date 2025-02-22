@@ -8,7 +8,6 @@ from bs4 import BeautifulSoup
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
 def authenticator():
-    """Authenticates with Gmail API and returns a service object."""
     flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
     creds = flow.run_local_server(port=0)
     return build('gmail', 'v1', credentials=creds)
@@ -34,7 +33,6 @@ def body(message):
     return body 
 
 def get_last_month_senders(service):
-    """Fetches eFmails from the last month and prints sender information."""
     month = (datetime.now() - timedelta(days=30)).strftime('%Y/%m/%d')
 
     response = service.users().messages().list(userId='me', q=f'after:{month} is:unread').execute()
@@ -44,25 +42,22 @@ def get_last_month_senders(service):
         print("No emails found in the last month.")
         return
 
-    print("\n--- Senders of Emails from the Last Month ---\n")
     for msg in messages: 
         msg_id = msg['id']
         message = service.users().messages().get(userId='me', id=msg_id).execute()
 
-        # Extract sender from email headers
         headers = message.get('payload', {}).get('headers', [])
+
+        # variables to send to SQL database
         sender = next((header['value'] for header in headers if header['name'] == 'From'), "Unknown Sender")
         subject = next((header['value'] for header in headers if header['name'] == 'Subject'), "No Subject")
         date = next((header['value'] for header in headers if header['name'] == 'Date'))
+        profile = service.users().getProfile(userId='me').execute()
+        receiver = profile['emailAddress']
         text = body(message)
 
+    
 
 
-        #print(sender)
-        #print(subject)
-        #print(text)
-        print(date)
-
-# Authenticate and fetch senders
 service = authenticator()
 get_last_month_senders(service)
