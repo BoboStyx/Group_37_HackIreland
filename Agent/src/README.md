@@ -1,16 +1,20 @@
-# AI Agent Project
+# AI Agent System
 
-This project implements an AI agent system that combines multiple language models (ChatGPT-4 and O3-mini) for enhanced reasoning and task execution capabilities.
+A robust AI agent system that combines multiple language models (ChatGPT-4, Gemini Pro, and O3-mini) for enhanced reasoning, task execution, and email processing capabilities.
 
 ## Project Structure
 
 ```
 project/
-├── agent.py             # Main AI flow
+├── agent.py             # Main AI agent logic
+├── api.py              # FastAPI web endpoints
 ├── cli.py              # Terminal interface
-├── api.py              # Web API endpoints
-├── config.py           # Configuration constants
-├── database.py         # SQL database interactions
+├── config.py           # Legacy configuration (deprecated)
+├── server_config.py    # New server configuration system
+├── database.py         # Database models and operations
+├── email_processor.py  # Email analysis with Gemini AI
+├── get_mail.py         # Gmail integration
+├── Pull.py            # Email database operations
 ├── chatgpt_agent.py    # ChatGPT-4 interactions
 ├── o3_mini.py          # O3-mini integration
 └── tests/              # Test files
@@ -18,37 +22,43 @@ project/
 
 ## Features
 
-### Natural Language Task Management
-The AI agent can understand and process natural language requests to:
-- Modify task priorities ("this task is more urgent now")
-- Update task status ("mark this as completed")
-- Add notes to tasks ("add a note that John will help with this")
-- Set reminders ("remind me about this next week")
-- Change task descriptions ("update the description to include...")
+### Multi-Model AI Processing
+- ChatGPT-4 for natural language understanding and task management
+- Gemini Pro for email analysis and task extraction
+- O3-mini for complex reasoning and deep analysis
+- Automatic model selection and fallback
 
-### Intelligent Task Processing
-- Automatically prioritizes tasks by urgency (levels 1-5)
-- Handles half-completed tasks with special priority
-- Processes tasks in chunks for efficient handling
-- Generates clear summaries of task groups
+### Email Integration
+- Gmail API integration for email fetching
+- Intelligent email analysis and task extraction
+- Automatic task creation from email content
+- Opportunity detection from communications
 
-### Smart Model Selection
-- Uses ChatGPT-4 for regular interactions
-- Switches to O3-mini for complex analysis
-- Automatic fallback between models
+### Task Management
+- Natural language task processing
+- Automatic task prioritization (urgency levels 1-5)
+- Smart deadline detection and handling
+- Task grouping and summarization
+
+### Server Features
+- FastAPI-based REST API
+- Multi-environment support (development, testing, production)
+- Comprehensive error handling and logging
+- Health monitoring endpoints
 
 ### Database Integration
-- Real-time task updates and modifications
-- Persistent conversation history
-- Structured user profiles
-- Comprehensive task tracking
+- Multi-environment database support
+- Connection pooling and management
+- Robust error handling
+- Transaction management
 
 ## Setup
 
-1. Create a virtual environment:
+1. Create and activate virtual environment:
 ```bash
 python -m venv venv
 source venv/bin/activate  # On Unix/MacOS
+.\venv\Scripts\activate   # On Windows
 ```
 
 2. Install dependencies:
@@ -56,79 +66,180 @@ source venv/bin/activate  # On Unix/MacOS
 pip install -r requirements.txt
 ```
 
-3. Configure environment variables:
+3. Configure environment:
 - Copy `.env.example` to `.env`
-- Add your API keys and configuration
-- Set up your MySQL database connection
+- Set environment variables:
+```env
+# Environment
+ENVIRONMENT=development  # development, testing, or production
 
-4. Initialize the database:
+# Server Settings
+API_HOST=0.0.0.0
+API_PORT=8000
+API_WORKERS=4
+API_TIMEOUT=60
+
+# Database Configuration
+DEV_DB_HOST=localhost
+DEV_DB_USER=dev_user
+DEV_DB_PASSWORD=dev_password
+DEV_DB_NAME=ai_agent_dev
+DEV_DB_PORT=3306
+
+TEST_DB_HOST=localhost
+TEST_DB_USER=test_user
+TEST_DB_PASSWORD=test_password
+TEST_DB_NAME=ai_agent_test
+TEST_DB_PORT=3306
+
+PROD_DB_HOST=your_prod_host
+PROD_DB_USER=prod_user
+PROD_DB_PASSWORD=prod_password
+PROD_DB_NAME=ai_agent_prod
+PROD_DB_PORT=3306
+
+# API Keys
+OPENAI_API_KEY=your_openai_key
+GEMINI_API_KEY=your_gemini_key
+O3_MINI_API_KEY=your_o3_key
+
+# Gmail API
+GMAIL_CREDENTIALS_FILE=credentials.json
+
+# Model Settings
+GEMINI_TEMPERATURE=0.7
+GEMINI_TOP_K=40
+GEMINI_TOP_P=0.95
+GEMINI_MAX_TOKENS=1024
+
+# Processing Limits
+MAX_EMAILS=50
+MAX_TOKENS=50000
+```
+
+4. Set up Gmail API:
+- Create a Google Cloud project
+- Enable Gmail API
+- Download credentials and save as `credentials.json`
+
+5. Initialize database:
 ```bash
-./setup_database.sh -u your_username -p
+python -c "from database import init_db; init_db()"
 ```
 
 ## Usage
 
-### Command Line Interface
+### Start API Server
 ```bash
-python cli.py
+# Development
+uvicorn api:app --reload --host 0.0.0.0 --port 8000
+
+# Production
+uvicorn api:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
-Example interactions:
+### API Endpoints
+
+#### Task Management
 ```
-> Show me my urgent tasks
-[AI shows tasks prioritized by urgency]
-
-> This security patch is more critical now
-[AI updates task urgency and adds a note explaining the change]
-
-> Remind me about the client meeting tomorrow morning
-[AI sets a reminder and confirms]
-
-> I need help breaking down the documentation task
-[AI analyzes the task and provides detailed subtasks]
+POST /process          # Process user input
+GET  /tasks           # Get task summaries
+POST /update_task     # Update task status
+POST /think_deep      # Deep analysis with O3-mini
+GET  /health          # Server health check
 ```
 
-### Web API
+Example task processing:
 ```bash
-uvicorn api:app --host 0.0.0.0 --port 8000
+curl -X POST http://localhost:8000/process \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Schedule a meeting with John about the project", "context": {"urgency": "high"}}'
 ```
+
+### Email Processing
+Run the email processor:
+```bash
+python get_mail.py
+```
+
+This will:
+1. Authenticate with Gmail
+2. Fetch recent unread emails
+3. Analyze content using Gemini AI
+4. Create tasks and opportunities
+5. Mark emails as read
 
 ## Development
 
 ### Adding New Features
-- Follow the existing pattern in `agent.py`
-- Add database operations in `database.py`
-- Update tests accordingly
-- Document changes in docstrings
+1. Update database models in `database.py`
+2. Add API endpoints in `api.py`
+3. Implement business logic in appropriate modules
+4. Add error handling and logging
+5. Update tests
+
+### Code Style
+- Follow PEP 8
+- Use type hints
+- Add docstrings (Google style)
+- Implement proper error handling
+- Add logging statements
 
 ### Testing
 ```bash
-pytest tests/
+# Run all tests
+pytest
+
+# Run with coverage
+pytest --cov=. tests/
+
+# Generate coverage report
+coverage html
 ```
 
-### Code Style
-- Follow PEP 8 guidelines
-- Use type hints
-- Include docstrings for all functions
-- Log important operations
+### Error Handling
+The system implements comprehensive error handling:
+- Custom exceptions for different error types
+- Proper error propagation
+- Detailed error logging
+- User-friendly error responses
 
-## Configuration
+### Logging
+Logging is configured based on environment:
+- Development: DEBUG level
+- Production: INFO level
+- Structured log format
+- Separate logs for different components
 
-Key settings in `.env`:
-```env
-# API Keys
-OPENAI_API_KEY=your_key_here
-O3_MINI_API_KEY=your_key_here
+## Deployment
 
-# Database
-DATABASE_URL=mysql://user:pass@localhost/ai_agent
+### Docker
+```bash
+# Build image
+docker build -t ai-agent .
 
-# Agent Settings
-MAX_TOKENS=1000
-MAX_EMAILS=5
-LOG_LEVEL=INFO
+# Run container
+docker run -d \
+  -p 8000:8000 \
+  --env-file .env \
+  --name ai-agent \
+  ai-agent
+```
+
+### Kubernetes
+Kubernetes manifests are provided in the `k8s/` directory:
+```bash
+kubectl apply -f k8s/
 ```
 
 ## License
 
-MIT License 
+MIT License
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add/update tests
+5. Submit a pull request 

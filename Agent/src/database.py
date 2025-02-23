@@ -2,19 +2,60 @@
 Database models and interactions for the AI agent system.
 """
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
+from contextlib import contextmanager
+import os
 
-from sqlalchemy import create_engine, Column, Integer, String, Text
+from sqlalchemy import create_engine, Column, Integer, String, Text, event
 from sqlalchemy.dialects.mysql import DATETIME
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
-from config import DATABASE_URL
+from server_config import db_config, server_config
 
-# Create database engine
-engine = create_engine(DATABASE_URL)
+# Create database engine based on environment
+engine = create_engine(
+    db_config.get_url(server_config.environment),
+    pool_size=20,
+    max_overflow=0,
+    pool_timeout=30,
+    pool_recycle=1800
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+class DatabaseError(Exception):
+    """Custom exception for database errors."""
+    pass
+
+@contextmanager
+def get_db() -> Session:
+    """Get database session with proper error handling."""
+    db = SessionLocal()
+    try:
+        yield db
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise DatabaseError(f"Database error: {str(e)}")
+    finally:
+        db.close()
+
+# Add event listeners for connection pool management
+@event.listens_for(engine, "connect")
+def connect(dbapi_connection, connection_record):
+    connection_record.info['pid'] = os.getpid()
+
+@event.listens_for(engine, "checkout")
+def checkout(dbapi_connection, connection_record, connection_proxy):
+    pid = os.getpid()
+    if connection_record.info['pid'] != pid:
+        connection_record.connection = connection_proxy.connection = None
+        raise exc.DisconnectionError(
+            "Connection record belongs to pid %s, attempting to check out in pid %s" %
+            (connection_record.info['pid'], pid)
+        )
 
 class Conversation(Base):
     """Model for storing conversation history."""
@@ -60,69 +101,70 @@ class UserProfile(Base):
 
 def init_db():
     """Initialize the database by creating all tables."""
-    Base.metadata.create_all(bind=engine)
-
-def get_db():
-    """Get database session."""
-    db = SessionLocal()
     try:
-        yield db
-    finally:
-        db.close()
+        Base.metadata.create_all(bind=engine)
+    except SQLAlchemyError as e:
+        raise DatabaseError(f"Failed to initialize database: {str(e)}")
 
-def get_tasks_by_urgency(urgency_level: int) -> List[dict]:
+def get_tasks_by_urgency(urgency_level: int) -> List[Dict[str, Any]]:
     """
     Retrieve tasks from the database with the specified urgency.
     
-    Parameters:
-        urgency_level (int): The urgency level to filter tasks (e.g., 5, 4, 3, etc.)
+    Args:
+        urgency_level (int): The urgency level to filter tasks (1-5)
     
     Returns:
-        List[dict]: A list of tasks as dictionaries with keys:
-                   id, description, urgency, status, and alertAt
+        List[Dict[str, Any]]: List of tasks as dictionaries
+    
+    Raises:
+        DatabaseError: If database operation fails
+        ValueError: If urgency level is invalid
     """
+    if not 1 <= urgency_level <= 5:
+        raise ValueError("Urgency level must be between 1 and 5")
+        
     query = text("""
         SELECT id, description, urgency, status, alertAt 
         FROM tasks 
         WHERE urgency = :urgency
+        ORDER BY alertAt DESC NULLS LAST
     """)
-    with engine.connect() as conn:
-        result = conn.execute(query, {"urgency": urgency_level})
-        tasks = []
-        for row in result:
-            # Convert row to dictionary using column names
-            task_dict = {
-                'id': row[0],
-                'description': row[1],
-                'urgency': row[2],
-                'status': row[3],
-                'alertAt': row[4]
-            }
-            tasks.append(task_dict)
-    return tasks
-
-def update_task_status(task_id: int, status: str, alert_at: Optional[datetime]) -> None:
-    """
-    Update the status and alert time of a task in the database.
     
-    Parameters:
-        task_id (int): The unique identifier of the task
-        status (str): The new status of the task (e.g., 'pending', 'half-completed', 'completed')
-        alert_at (Optional[datetime]): The datetime to set for the alert reminder; can be None
-                                     if no reminder is needed
+    try:
+        with get_db() as db:
+            result = db.execute(query, {"urgency": urgency_level})
+            return [dict(row) for row in result]
+    except DatabaseError as e:
+        raise DatabaseError(f"Failed to get tasks: {str(e)}")
+
+def update_task_status(task_id: int, status: str, alert_at: Optional[datetime] = None) -> None:
+    """
+    Update task status and alert time.
+    
+    Args:
+        task_id (int): Task ID
+        status (str): New status
+        alert_at (Optional[datetime]): Alert time
+        
+    Raises:
+        DatabaseError: If update fails
     """
     query = text("""
         UPDATE tasks
         SET status = :status, alertAt = :alert_at
         WHERE id = :task_id
     """)
-    with engine.connect() as conn:
-        conn.execute(query, {
-            "status": status,
-            "alert_at": alert_at,
-            "task_id": task_id
-        })
-        conn.commit()
+    
+    try:
+        with get_db() as db:
+            db.execute(query, {
+                "status": status,
+                "alert_at": alert_at,
+                "task_id": task_id
+            })
+            db.commit()
+    except DatabaseError as e:
+        raise DatabaseError(f"Failed to update task status: {str(e)}")
 
 def update_task_urgency(task_id: int, urgency: int) -> None:
     """
@@ -225,30 +267,29 @@ def create_task(description: str, urgency: int, status: str = 'pending', alert_a
         task_id = result.lastrowid
         return task_id
 
-def get_task_by_id(task_id: int) -> Optional[dict]:
+def get_task_by_id(task_id: int) -> Optional[Dict[str, Any]]:
     """
-    Retrieve a single task by its ID.
+    Get task by ID with proper error handling.
     
-    Parameters:
-        task_id (int): The unique identifier of the task
-    
+    Args:
+        task_id (int): Task ID
+        
     Returns:
-        Optional[dict]: The task as a dictionary if found, None otherwise
+        Optional[Dict[str, Any]]: Task data or None if not found
+        
+    Raises:
+        DatabaseError: If query fails
     """
     query = text("""
         SELECT id, description, urgency, status, alertAt 
         FROM tasks 
         WHERE id = :task_id
     """)
-    with engine.connect() as conn:
-        result = conn.execute(query, {"task_id": task_id})
-        row = result.fetchone()
-        if row is None:
-            return None
-        return {
-            'id': row[0],
-            'description': row[1],
-            'urgency': row[2],
-            'status': row[3],
-            'alertAt': row[4]
-        } 
+    
+    try:
+        with get_db() as db:
+            result = db.execute(query, {"task_id": task_id})
+            row = result.fetchone()
+            return dict(row) if row else None
+    except DatabaseError as e:
+        raise DatabaseError(f"Failed to get task: {str(e)}") 

@@ -1,87 +1,138 @@
 """
 FastAPI web API endpoints for the AI agent.
 """
-from typing import Optional, Dict, List
-from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel
+import logging
+from typing import Optional, Dict, List, Any
+from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 import uvicorn
 from datetime import datetime
+from sqlalchemy import text
 
-from agent import AIAgent, chunk_tasks
-from database import get_db, SessionLocal, get_tasks_by_urgency, update_task_status
-from config import (
-    API_HOST, API_PORT, API_TITLE, API_VERSION, API_DESCRIPTION,
-    HIGH_PRIORITY_URGENCY_LEVELS
+from agent import AIAgent
+from database import (
+    get_db,
+    DatabaseError,
+    get_tasks_by_urgency,
+    update_task_status,
+    create_task,
+    get_task_by_id
 )
+from server_config import server_config
 from o3_mini import O3MiniAgent
 
-app = FastAPI(
-    title=API_TITLE,
-    version=API_VERSION,
-    description=API_DESCRIPTION
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO if not server_config.debug else logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI(
+    title=server_config.api_title,
+    version=server_config.api_version,
+    description=server_config.api_description,
+    debug=server_config.debug
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize agents
 agent = AIAgent()
 o3_mini = O3MiniAgent()
 
 class UserInput(BaseModel):
     """Model for user input requests."""
-    text: str
-    context: Optional[Dict] = None
+    text: str = Field(..., description="User input text")
+    context: Optional[Dict[str, Any]] = Field(None, description="Optional context")
 
 class AgentResponse(BaseModel):
     """Model for agent responses."""
-    response: str
-    model_used: str
+    response: str = Field(..., description="Agent's response")
+    model_used: str = Field(..., description="Model used for processing")
 
 class TaskSummary(BaseModel):
     """Model for task summaries."""
-    summaries: List[str]
+    summaries: List[str] = Field(..., description="List of task summaries")
 
 class TaskUpdate(BaseModel):
     """Model for task update requests."""
-    task_id: int
-    status: str
-    alert_at: Optional[datetime] = None
+    task_id: int = Field(..., description="Task ID")
+    status: str = Field(..., description="New task status")
+    alert_at: Optional[datetime] = Field(None, description="Optional alert time")
 
 class ThinkDeepRequest(BaseModel):
     """Model for deep thinking requests."""
-    prompt: str
+    prompt: str = Field(..., description="Prompt for deep thinking")
 
 class ThinkDeepResponse(BaseModel):
     """Model for deep thinking responses."""
-    result: str
+    result: str = Field(..., description="Deep thinking result")
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all incoming requests."""
+    logger.info(f"Request: {request.method} {request.url}")
+    response = await call_next(request)
+    logger.info(f"Response status: {response.status_code}")
+    return response
+
+@app.exception_handler(DatabaseError)
+async def database_error_handler(request: Request, exc: DatabaseError):
+    """Handle database errors."""
+    logger.error(f"Database error: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Database operation failed"}
+    )
 
 @app.post("/process", response_model=AgentResponse)
 async def process_input(user_input: UserInput):
     """
     Process user input and return the agent's response.
     """
+    logger.info(f"Processing input: {user_input.text[:100]}...")
     try:
         response = await agent.process_input(user_input.text, user_input.context)
         return AgentResponse(
             response=response,
-            model_used="gpt-4"  # This will be updated based on actual model used
+            model_used=agent.last_model_used
         )
     except Exception as e:
+        logger.error(f"Error processing input: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/tasks", response_model=TaskSummary)
-async def get_tasks():
+async def get_tasks(urgency: Optional[int] = None):
     """
     Retrieve and summarize tasks ordered by urgency.
-    Returns a summary of tasks chunked and processed for efficient viewing.
+    
+    Args:
+        urgency: Optional urgency level filter (1-5)
     """
     try:
-        # Get tasks by high priority urgency levels
-        all_tasks = []
-        for urgency in HIGH_PRIORITY_URGENCY_LEVELS:
+        # Get tasks filtered by urgency if specified
+        if urgency is not None:
             tasks = get_tasks_by_urgency(urgency)
-            all_tasks.extend(tasks)
+        else:
+            all_tasks = []
+            for level in range(5, 0, -1):
+                tasks = get_tasks_by_urgency(level)
+                all_tasks.extend(tasks)
+            tasks = all_tasks
 
-        # Chunk the tasks
-        task_chunks = agent._chunk_tasks(all_tasks)
-        
-        # Get summaries using ChatGPT
+        # Chunk and summarize tasks
+        task_chunks = agent._chunk_tasks(tasks)
         summaries = []
         for chunk in task_chunks:
             chunk_text = agent._format_tasks_for_summary(chunk)
@@ -89,7 +140,10 @@ async def get_tasks():
             summaries.append(summary)
 
         return TaskSummary(summaries=summaries)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.error(f"Error getting tasks: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/update_task")
@@ -98,38 +152,72 @@ async def update_task(task_update: TaskUpdate):
     Update a task's status and alert time.
     """
     try:
+        # Verify task exists
+        task = get_task_by_id(task_update.task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+            
         update_task_status(
             task_update.task_id,
             task_update.status,
             task_update.alert_at
         )
         return {"message": f"Task {task_update.task_id} updated successfully"}
+    except DatabaseError as e:
+        # Will be handled by the database_error_handler
+        raise
     except Exception as e:
+        logger.error(f"Error updating task: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/think_deep", response_model=ThinkDeepResponse)
 async def think_deep(request: ThinkDeepRequest):
     """
     Process a deep thinking request using the O3-mini model.
-    This endpoint is designed for complex problems requiring deeper analysis.
     """
     try:
         if not o3_mini.is_available:
             raise HTTPException(
                 status_code=503,
-                detail="O3-mini model is not available. Please check API configuration."
+                detail="O3-mini model is not available"
             )
         
         result = await o3_mini.think_deep(request.prompt)
         return ThinkDeepResponse(result=result)
     except Exception as e:
+        logger.error(f"Error in deep thinking: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy"}
+    try:
+        # Check database connection
+        with get_db() as db:
+            db.execute(text("SELECT 1"))
+        
+        return {
+            "status": "healthy",
+            "environment": server_config.environment,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "detail": str(e),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
 
 def start_api():
     """Start the FastAPI server."""
-    uvicorn.run(app, host=API_HOST, port=API_PORT) 
+    uvicorn.run(
+        app,
+        host=server_config.api_host,
+        port=server_config.api_port,
+        workers=server_config.api_workers,
+        timeout_keep_alive=server_config.api_timeout
+    ) 
