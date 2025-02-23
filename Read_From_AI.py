@@ -1,3 +1,5 @@
+'''
+
 import mysql.connector
 from mysql.connector import errorcode
 
@@ -58,3 +60,6 @@ except mysql.connector.Error as err:
         print("Database does not exist")
     else:
         print(err)
+'''
+
+#Edit as please, above was just sample code.
