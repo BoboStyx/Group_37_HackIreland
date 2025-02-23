@@ -5,8 +5,9 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 import os
+import json
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, event
+from sqlalchemy import create_engine, Column, Integer, String, Text, event, DateTime
 from sqlalchemy.dialects.mysql import DATETIME
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from sqlalchemy import text
@@ -64,7 +65,7 @@ class Conversation(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_input = Column(Text, nullable=False)
     agent_response = Column(Text, nullable=False)
-    model_used = Column(String(50), nullable=False)
+    model_used = Column(String(50), nullable=False, default="gpt-4")  # Default to GPT-4
     timestamp = Column(DATETIME(fsp=6), default=datetime.utcnow)
     meta_data = Column(Text, nullable=True)
 
@@ -89,6 +90,22 @@ class Task(Base):
     status = Column(String(50), nullable=False)
     alertAt = Column(DATETIME(fsp=6), nullable=True)
 
+class Event(Base):
+    """Model for storing calendar events."""
+    __tablename__ = "events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    start_time = Column(DATETIME(fsp=6), nullable=False)
+    end_time = Column(DATETIME(fsp=6), nullable=True)
+    location = Column(String(255), nullable=True)
+    participants = Column(Text, nullable=True)  # JSON array of participants
+    source = Column(String(255), nullable=True)  # Where the event was detected from
+    source_link = Column(String(512), nullable=True)  # Link to original source (e.g., email)
+    created_at = Column(DATETIME(fsp=6), default=datetime.utcnow)
+    updated_at = Column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
+
 class UserProfile(Base):
     """Model for storing user profiles."""
     __tablename__ = "user_profiles"
@@ -98,6 +115,18 @@ class UserProfile(Base):
     updated_at = Column(DATETIME(fsp=6), default=datetime.utcnow, onupdate=datetime.utcnow)
     raw_input = Column(Text, nullable=False)
     structured_profile = Column(Text, nullable=False)  # JSON string of the profile
+
+class GmailCredentials(Base):
+    """Model for storing Gmail credentials."""
+    __tablename__ = "gmail_credentials"
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(255), nullable=False, unique=True)
+    credentials = Column(Text, nullable=False)  # Encrypted credentials
+    email = Column(String(255), nullable=False)
+    last_sync = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 def init_db():
     """Initialize the database by creating all tables."""
@@ -127,7 +156,7 @@ def get_tasks_by_urgency(urgency_level: int) -> List[Dict[str, Any]]:
         SELECT id, description, urgency, status, alertAt 
         FROM tasks 
         WHERE urgency = :urgency
-        ORDER BY alertAt DESC NULLS LAST
+        ORDER BY CASE WHEN alertAt IS NULL THEN 1 ELSE 0 END, alertAt DESC
     """)
     
     try:
@@ -292,4 +321,128 @@ def get_task_by_id(task_id: int) -> Optional[Dict[str, Any]]:
             row = result.fetchone()
             return dict(row) if row else None
     except DatabaseError as e:
-        raise DatabaseError(f"Failed to get task: {str(e)}") 
+        raise DatabaseError(f"Failed to get task: {str(e)}")
+
+def create_event(title: str, description: Optional[str], start_time: datetime,
+                end_time: Optional[datetime] = None, location: Optional[str] = None,
+                participants: Optional[List[str]] = None, source: Optional[str] = None,
+                source_link: Optional[str] = None) -> int:
+    """
+    Create a new event in the database.
+    
+    Args:
+        title: Event title
+        description: Optional event description
+        start_time: Event start time
+        end_time: Optional event end time
+        location: Optional event location
+        participants: Optional list of participants
+        source: Optional source of the event (e.g., 'email', 'manual')
+        source_link: Optional link to source
+        
+    Returns:
+        int: The ID of the newly created event
+        
+    Raises:
+        DatabaseError: If creation fails
+    """
+    try:
+        with get_db() as db:
+            event = Event(
+                title=title,
+                description=description,
+                start_time=start_time,
+                end_time=end_time,
+                location=location,
+                participants=json.dumps(participants) if participants else None,
+                source=source,
+                source_link=source_link
+            )
+            db.add(event)
+            db.commit()
+            db.refresh(event)
+            return event.id
+    except Exception as e:
+        raise DatabaseError(f"Failed to create event: {str(e)}")
+
+def get_events_by_timeframe(start: datetime, end: datetime) -> List[Dict[str, Any]]:
+    """
+    Get events within a specific timeframe.
+    
+    Args:
+        start: Start of timeframe
+        end: End of timeframe
+        
+    Returns:
+        List[Dict[str, Any]]: List of events
+    """
+    try:
+        with get_db() as db:
+            events = db.query(Event).filter(
+                Event.start_time >= start,
+                Event.start_time <= end
+            ).order_by(Event.start_time).all()
+            
+            return [
+                {
+                    "id": event.id,
+                    "title": event.title,
+                    "description": event.description,
+                    "start_time": event.start_time,
+                    "end_time": event.end_time,
+                    "location": event.location,
+                    "participants": json.loads(event.participants) if event.participants else None,
+                    "source": event.source,
+                    "source_link": event.source_link
+                }
+                for event in events
+            ]
+    except Exception as e:
+        raise DatabaseError(f"Failed to get events: {str(e)}")
+
+def update_event(event_id: int, **kwargs) -> None:
+    """
+    Update an event's details.
+    
+    Args:
+        event_id: ID of event to update
+        **kwargs: Fields to update
+        
+    Raises:
+        DatabaseError: If update fails
+    """
+    try:
+        with get_db() as db:
+            event = db.query(Event).filter(Event.id == event_id).first()
+            if not event:
+                raise ValueError(f"Event {event_id} not found")
+                
+            # Handle participants separately as it needs JSON conversion
+            if 'participants' in kwargs:
+                kwargs['participants'] = json.dumps(kwargs['participants'])
+                
+            for key, value in kwargs.items():
+                setattr(event, key, value)
+                
+            db.commit()
+    except Exception as e:
+        raise DatabaseError(f"Failed to update event: {str(e)}")
+
+def delete_event(event_id: int) -> None:
+    """
+    Delete an event.
+    
+    Args:
+        event_id: ID of event to delete
+        
+    Raises:
+        DatabaseError: If deletion fails
+    """
+    try:
+        with get_db() as db:
+            event = db.query(Event).filter(Event.id == event_id).first()
+            if event:
+                db.delete(event)
+                db.commit()
+    except Exception as e:
+        raise DatabaseError(f"Failed to delete event: {str(e)}") 

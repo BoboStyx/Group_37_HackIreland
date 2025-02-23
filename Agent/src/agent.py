@@ -9,7 +9,7 @@ import re
 
 from chatgpt_agent import ChatGPTAgent
 from o3_mini import O3MiniAgent
-from database import SessionLocal, Conversation, AgentTask, Task, get_tasks_by_urgency, update_task_status, get_task_by_id, update_task_urgency, append_task_notes, create_task, update_task_description
+from database import SessionLocal, Conversation, AgentTask, Task, get_tasks_by_urgency, update_task_status, get_task_by_id, update_task_urgency, append_task_notes, create_task, update_task_description, get_events_by_timeframe, create_event, update_event, delete_event
 from config import (
     MAX_RETRIES, TIMEOUT, MAX_TOKENS, MAX_EMAILS,
     URGENCY_ORDER, HALF_FINISHED_PRIORITY
@@ -25,7 +25,15 @@ class AIAgent:
         """Initialize the AI agent with its component models."""
         self.chatgpt = ChatGPTAgent()
         self.o3_mini = O3MiniAgent()
+        self.last_model_used = "gpt-4"  # Default to GPT-4
         self.db = None  # Initialize as None
+        self.context = {
+            "history": [],
+            "available_tasks": [],
+            "available_events": [],  # Add events to context
+            "current_task_id": None,
+            "current_event_id": None  # Add current event tracking
+        }
         try:
             self.db = SessionLocal()
         except Exception as e:
@@ -124,12 +132,14 @@ class AIAgent:
                     if profile:
                         greeting_context['profile'] = profile
                 
+                self.last_model_used = "gpt-4"  # Greetings always use GPT-4
                 async for chunk in self.chatgpt.process(greeting_prompt, greeting_context):
                     yield chunk
                 return
 
             # For everything else, process naturally with task context
             if context and 'tasks' in context:
+                self.last_model_used = "gpt-4"  # Task handling uses GPT-4
                 async for chunk in self.handle_task_input(user_input, context['tasks'], context):
                     yield chunk
                 
@@ -155,17 +165,17 @@ class AIAgent:
             response_chunks = []
             try:
                 if use_o3_mini:
+                    self.last_model_used = "o3-mini"
                     async for chunk in self.o3_mini.process(user_input, context):
                         response_chunks.append(chunk)
                         yield chunk
-                    model_used = "o3-mini"
                 else:
                     if not self.chatgpt.is_available:
                         raise RuntimeError("ChatGPT is not available and this input requires it")
+                    self.last_model_used = "gpt-4"
                     async for chunk in self.chatgpt.process(user_input, context):
                         response_chunks.append(chunk)
                         yield chunk
-                    model_used = "gpt-4"
 
                 # If we learned something about the user, mention it naturally after the response
                 if learned_something and profile_insight:
@@ -177,16 +187,16 @@ class AIAgent:
                 response_chunks = []
                 if use_o3_mini and self.chatgpt.is_available:
                     logger.info("Falling back to ChatGPT")
+                    self.last_model_used = "gpt-4"
                     async for chunk in self.chatgpt.process(user_input, context):
                         response_chunks.append(chunk)
                         yield chunk
-                    model_used = "gpt-4"
                 elif not use_o3_mini and self.o3_mini.is_available:
                     logger.info("Falling back to O3-mini")
+                    self.last_model_used = "o3-mini"
                     async for chunk in self.o3_mini.process(user_input, context):
                         response_chunks.append(chunk)
                         yield chunk
-                    model_used = "o3-mini"
                 else:
                     raise
 
@@ -200,7 +210,7 @@ class AIAgent:
             conversation = Conversation(
                 user_input=user_input,
                 agent_response=response,
-                model_used=model_used
+                model_used=self.last_model_used
             )
             self.db.add(conversation)
 
@@ -388,20 +398,13 @@ class AIAgent:
             raise
 
     def _format_tasks_for_ai(self, items: List[dict]) -> str:
-        """
-        Format tasks and information items for AI consumption.
-        
-        Args:
-            items: List of tasks and information items
-            
-        Returns:
-            str: Formatted string of items
-        """
+        """Format tasks, information items, and events for AI consumption."""
         formatted = []
         
         # Group items by type
         tasks = [i for i in items if i.get('type', 'task') == 'task']
         info_items = [i for i in items if i.get('type') == 'info']
+        events = [i for i in items if i.get('type') == 'event']
         
         # Format tasks
         if tasks:
@@ -418,7 +421,7 @@ class AIAgent:
         
         # Format information items
         if info_items:
-            if tasks:  # Add a blank line if we had tasks
+            if formatted:  # Add a blank line if we had previous items
                 formatted.append("")
             formatted.append("Interesting Information:")
             for item in info_items:
@@ -428,6 +431,25 @@ class AIAgent:
                 if item.get('notes'):
                     info_str += f"\n  Notes: {item['notes']}"
                 formatted.append(info_str)
+        
+        # Format events
+        if events:
+            if formatted:  # Add a blank line if we had previous items
+                formatted.append("")
+            formatted.append("Upcoming Events:")
+            for event in events:
+                event_str = f"[Event #{event['id']}]: {event['title']}"
+                if event.get('start_time'):
+                    event_str += f"\n  When: {event['start_time'].strftime('%Y-%m-%d %H:%M')}"
+                    if event.get('end_time'):
+                        event_str += f" - {event['end_time'].strftime('%H:%M')}"
+                if event.get('location'):
+                    event_str += f"\n  Where: {event['location']}"
+                if event.get('participants'):
+                    event_str += f"\n  Who: {', '.join(event['participants'])}"
+                if event.get('description'):
+                    event_str += f"\n  Details: {event['description']}"
+                formatted.append(event_str)
         
         if not formatted:
             return "No items available."
@@ -853,12 +875,17 @@ class AIAgent:
             
             # Add current datetime to context
             current_time = datetime.utcnow()
+            
+            # Get upcoming events
+            upcoming_events = await self.get_events(current_time)
+            
             new_context.update({
                 "role": "task_helper",
                 "style": "conversational",
                 "focus": "context_aware",
                 "current_item": None,
                 "available_tasks": available_items,
+                "upcoming_events": upcoming_events,  # Add events to context
                 "current_time": current_time.isoformat(),
                 "current_time_readable": current_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
                 "user_timezone": "Europe/Dublin"  # Since you're in Ireland
@@ -992,33 +1019,36 @@ class AIAgent:
         actions = []
         logger.info(f"Extracting actions from response: {response}")
         
-        # Match task actions - handle both numeric IDs and named parameters
+        # Match task actions
         task_patterns = [
-            r'\[ACTION:(\w+):(\d+):([^\]]*)\]',  # Numeric ID pattern
-            r'\[ACTION:(\w+):task_id:([^\]:]+):([^\]]*)\]',  # Named parameter pattern
-            r'\[ACTION:(\w+):task_id:([^\]]*)\]',  # Simple named parameter pattern
-            r'\[ACTION:create_task:([^\]]*)\]'  # Create task pattern
+            r'\[ACTION:(\w+):(\d+):([^\]]*)\]',
+            r'\[ACTION:(\w+):task_id:([^\]:]+):([^\]]*)\]',
+            r'\[ACTION:(\w+):task_id:([^\]]*)\]',
+            r'\[ACTION:create_task:([^\]]*)\]'
         ]
         
+        # Match event actions
+        event_patterns = [
+            r'\[ACTION:event:(\w+):(\d+):([^\]]*)\]',  # For existing events
+            r'\[ACTION:create_event:([^\]]*)\]'  # For creating new events
+        ]
+        
+        # Extract task actions
         for pattern in task_patterns:
             task_matches = re.findall(pattern, response)
             for match in task_matches:
                 if isinstance(match, tuple):
                     if len(match) == 3:
                         action_type, task_id_or_value, details = match
-                        # For numeric pattern
                         try:
                             task_id = int(task_id_or_value)
                         except ValueError:
-                            # For named parameter pattern where task_id might be a value
                             task_id = None
                             details = task_id_or_value
                     elif len(match) == 2:
-                        # For simple named parameter pattern
                         action_type, details = match
                         task_id = None
                 else:
-                    # For create task pattern
                     action_type = 'create_task'
                     details = match
                     task_id = None
@@ -1029,6 +1059,27 @@ class AIAgent:
                     'details': details
                 }
                 logger.info(f"Extracted task action: {action}")
+                actions.append(action)
+        
+        # Extract event actions
+        for pattern in event_patterns:
+            event_matches = re.findall(pattern, response)
+            for match in event_matches:
+                if isinstance(match, tuple):
+                    action_type, event_id, details = match
+                    action = {
+                        'type': 'event',
+                        'subtype': action_type,
+                        'event_id': int(event_id),
+                        'details': details
+                    }
+                else:
+                    action = {
+                        'type': 'event',
+                        'subtype': 'create',
+                        'details': match
+                    }
+                logger.info(f"Extracted event action: {action}")
                 actions.append(action)
         
         # Match profile actions
@@ -1051,8 +1102,49 @@ class AIAgent:
             action_feedback = None
             logger.info(f"Processing action: {action}")
             
+            # Handle event actions
+            if action['type'] == 'event':
+                if action['subtype'] == 'create':
+                    try:
+                        event_details = json.loads(action['details'])
+                        event_id = create_event(
+                            title=event_details['title'],
+                            description=event_details.get('description'),
+                            start_time=datetime.fromisoformat(event_details['start_time']),
+                            end_time=datetime.fromisoformat(event_details['end_time']) if event_details.get('end_time') else None,
+                            location=event_details.get('location'),
+                            participants=event_details.get('participants'),
+                            source=event_details.get('source'),
+                            source_link=event_details.get('source_link')
+                        )
+                        action_feedback = f"\n[✓ Created new event #{event_id}: {event_details['title']}]"
+                        logger.info(f"Created new event {event_id}. Details: {event_details}")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Invalid event creation details: {e}")
+                        action_feedback = "\n[❌ Failed to create event - invalid format]"
+                    except Exception as e:
+                        logger.error(f"Error creating event: {e}")
+                        action_feedback = "\n[❌ Failed to create event]"
+                elif action['subtype'] == 'update':
+                    try:
+                        event_details = json.loads(action['details'])
+                        update_event(action['event_id'], **event_details)
+                        action_feedback = f"\n[✓ Updated event #{action['event_id']}]"
+                        logger.info(f"Updated event {action['event_id']}. Details: {event_details}")
+                    except Exception as e:
+                        logger.error(f"Error updating event: {e}")
+                        action_feedback = "\n[❌ Failed to update event]"
+                elif action['subtype'] == 'delete':
+                    try:
+                        delete_event(action['event_id'])
+                        action_feedback = f"\n[✓ Deleted event #{action['event_id']}]"
+                        logger.info(f"Deleted event {action['event_id']}")
+                    except Exception as e:
+                        logger.error(f"Error deleting event: {e}")
+                        action_feedback = "\n[❌ Failed to delete event]"
+
             # Handle create_task action
-            if action['type'] == 'create_task':
+            elif action['type'] == 'create_task':
                 try:
                     task_details = json.loads(action['details'])
                     description = task_details.get('description')
@@ -1279,4 +1371,27 @@ class AIAgent:
             else:
                 return datetime.strptime(time_str, "%Y-%m-%d %H:%M")
         except:
-            return None 
+            return None
+
+    async def get_events(self, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None) -> List[dict]:
+        """
+        Retrieve events within a specified timeframe.
+        
+        Args:
+            start_time: Optional start time (defaults to now)
+            end_time: Optional end time (defaults to 30 days from start)
+            
+        Returns:
+            List[dict]: List of events
+        """
+        try:
+            if not start_time:
+                start_time = datetime.utcnow()
+            if not end_time:
+                end_time = start_time + timedelta(days=30)
+                
+            return get_events_by_timeframe(start_time, end_time)
+            
+        except Exception as e:
+            logger.error(f"Error retrieving events: {str(e)}")
+            raise 

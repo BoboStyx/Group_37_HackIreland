@@ -2,6 +2,8 @@
 
 A robust AI agent system that combines multiple language models (ChatGPT-4, Gemini Pro, and O3-mini) for enhanced reasoning, task execution, and email processing capabilities.
 
+python -m uvicorn api:app --reload --host 0.0.0.0 --port 8000
+
 ## Project Structure
 
 ```
@@ -234,12 +236,4 @@ kubectl apply -f k8s/
 
 ## License
 
-MIT License
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add/update tests
-5. Submit a pull request 
+All rights reserved.

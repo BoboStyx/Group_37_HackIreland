@@ -4,6 +4,7 @@ Server configuration settings for different environments.
 from typing import Dict, Any
 import os
 from dotenv import load_dotenv
+from urllib.parse import quote_plus
 
 # Load environment variables
 load_dotenv()
@@ -27,11 +28,11 @@ class DatabaseConfig:
                 'port': int(os.getenv('TEST_DB_PORT', 3306))
             },
             'production': {
-                'host': os.getenv('PROD_DB_HOST', 'localhost'),
-                'user': os.getenv('PROD_DB_USER', 'prod_user'),
-                'password': os.getenv('PROD_DB_PASSWORD', ''),
-                'database': os.getenv('PROD_DB_NAME', 'ai_agent_prod'),
-                'port': int(os.getenv('PROD_DB_PORT', 3306))
+                'host': os.getenv('DB_HOST', 'localhost'),
+                'user': os.getenv('DB_USER', 'Seyi'),
+                'password': os.getenv('DB_PASSWORD', 'S1906@duposiDCU'),
+                'database': os.getenv('DB_NAME', 'emails_db'),
+                'port': int(os.getenv('DB_PORT', 3306))
             }
         }
 
@@ -44,7 +45,8 @@ class DatabaseConfig:
     def get_url(self, environment: str) -> str:
         """Get SQLAlchemy URL for specified environment."""
         config = self.get_config(environment)
-        return f"mysql+mysqlconnector://{config['user']}:{config['password']}@{config['host']}:{config['port']}/{config['database']}"
+        password = quote_plus(config['password'])
+        return f"mysql+mysqlconnector://{config['user']}:{password}@{config['host']}:{config['port']}/{config['database']}"
 
 class ServerConfig:
     """Server configuration settings."""

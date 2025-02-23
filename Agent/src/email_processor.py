@@ -17,7 +17,8 @@ from database import (
     append_task_notes,
     UserProfile,
     get_db,
-    DatabaseError
+    DatabaseError,
+    create_event
 )
 from server_config import server_config
 
@@ -170,14 +171,14 @@ class EmailProcessor:
     
     async def _analyze_email(self, email: Dict[str, Any], user_profile: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Analyze an email using Gemini AI and create tasks/opportunities.
+        Analyze an email using Gemini AI and create tasks/opportunities/events.
         
         Args:
             email: Email data
             user_profile: Optional user profile for relevance scoring
             
         Returns:
-            List of created tasks/opportunities
+            List of created items
             
         Raises:
             EmailProcessingError: If analysis fails
@@ -210,7 +211,7 @@ class EmailProcessor:
                     logger.error("Invalid JSON response from Gemini AI")
                     return []
             
-            # Create tasks and opportunities
+            # Create tasks, opportunities, and events
             created_items = []
             
             # Process tasks
@@ -248,6 +249,23 @@ class EmailProcessor:
                 except Exception as e:
                     logger.error(f"Error creating opportunity: {str(e)}")
                     continue
+
+            # Process events
+            for event in analysis.get('events', []):
+                try:
+                    event_id = await self._create_event_from_analysis(event, email)
+                    if event_id:
+                        created_items.append({
+                            'type': 'event',
+                            'id': event_id,
+                            'source_email': email.get('subject'),
+                            'email_id': email.get('id'),
+                            'user_id': email.get('user_id'),
+                            'email_link': email.get('email_link')
+                        })
+                except Exception as e:
+                    logger.error(f"Error creating event: {str(e)}")
+                    continue
             
             return created_items
             
@@ -268,7 +286,7 @@ class EmailProcessor:
         # Determine email client from link
         email_client = "Gmail" if "mail.google.com" in email.get('email_link', '') else "Outlook" if "outlook.office.com" in email.get('email_link', '') else "Email"
                 
-        prompt = f"""You are an intelligent email analyzer focused on identifying actionable tasks and valuable opportunities. Your goal is to carefully analyze each email while considering the user's profile and context.
+        prompt = f"""You are an intelligent email analyzer focused on identifying actionable tasks, valuable opportunities, and calendar events. Your goal is to carefully analyze each email while considering the user's profile and context.
 
 Email Details:
 - Subject: {email.get('subject')}
@@ -297,8 +315,21 @@ Analysis Guidelines:
    - Consider alignment with user's interests and goals
    - Rate relevance based on user's profile (0-100)
 
-3. Critical Filtering:
-   - Not every email needs a task or opportunity
+3. Event Detection:
+   - Look for meeting invites, scheduled calls, or any time-based commitments
+   - Extract key event details:
+     * Title/Subject
+     * Start time and duration/end time
+     * Location (physical or virtual)
+     * Participants/Attendees
+   - Pay attention to:
+     * Date and time mentions
+     * Meeting links (Zoom, Teams, etc.)
+     * Location details
+     * RSVP requests
+
+4. Critical Filtering:
+   - Not every email needs a task, opportunity, or event
    - Focus on actionable items and meaningful opportunities
    - Ignore routine notifications unless they require action
    - Pay special attention to:
@@ -306,6 +337,7 @@ Analysis Guidelines:
      * Deadlines or schedule changes
      * Important updates requiring action
      * Opportunities matching user's interests/goals
+     * Calendar invites or meeting requests
 
 Format your response as JSON with this structure:
 {{
@@ -328,10 +360,21 @@ Format your response as JSON with this structure:
             "key_stakeholders": ["relevant people"],
             "source_reference": "View in {email_client}"
         }}
+    ],
+    "events": [
+        {{
+            "title": "Event title",
+            "description": "Event description",
+            "start_time": "YYYY-MM-DD HH:MM:SS",
+            "end_time": "YYYY-MM-DD HH:MM:SS" or null,
+            "location": "Physical location or meeting link",
+            "participants": ["list", "of", "participants"],
+            "source_reference": "View in {email_client}"
+        }}
     ]
 }}
 
-Only include genuine tasks and opportunities. If none are found, return empty lists.
+Only include genuine tasks, opportunities, and events. If none are found, return empty lists.
 Ensure the response is valid JSON."""
 
         return prompt
@@ -428,4 +471,33 @@ Ensure the response is valid JSON."""
             
         except Exception as e:
             logger.error(f"Error creating opportunity: {str(e)}")
+            return None
+    
+    async def _create_event_from_analysis(self, event: Dict[str, Any], email: Dict[str, Any]) -> Optional[int]:
+        """Create an event from Gemini's analysis."""
+        try:
+            # Parse datetime strings
+            try:
+                start_time = datetime.strptime(event['start_time'], '%Y-%m-%d %H:%M:%S')
+                end_time = datetime.strptime(event['end_time'], '%Y-%m-%d %H:%M:%S') if event.get('end_time') else None
+            except ValueError as e:
+                logger.error(f"Error parsing event datetime: {str(e)}")
+                return None
+
+            # Create the event
+            event_id = create_event(
+                title=event['title'],
+                description=event.get('description'),
+                start_time=start_time,
+                end_time=end_time,
+                location=event.get('location'),
+                participants=event.get('participants'),
+                source='email',
+                source_link=email.get('email_link')
+            )
+            
+            return event_id
+            
+        except Exception as e:
+            logger.error(f"Error creating event: {str(e)}")
             return None 
