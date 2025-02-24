@@ -14,9 +14,9 @@ def count_tokens(text: str) -> int:
 
 def db_to_ai() -> List[Dict[str, Any]]:
     """Get emails from database with limits on count and tokens."""
-    DB_NAME = 'emails_db'
-    DB_USER = 'Seyi'
-    DB_PASSWORD = 'S1906@duposiDCU'
+    DB_NAME = 'your_db'
+    DB_USER = 'your_user'
+    DB_PASSWORD = 'your_password'
     DB_HOST = 'localhost'
     MAX_EMAILS = 50
     MAX_TOKENS = 50000
