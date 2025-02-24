@@ -3,16 +3,36 @@ Database models and interactions for the AI agent system.
 """
 from datetime import datetime
 from typing import Optional, List
+import logging
+import os
+from dotenv import load_dotenv
 
 from sqlalchemy import create_engine, Column, Integer, String, Text
 from sqlalchemy.dialects.mysql import DATETIME
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import text
 
-from config import DATABASE_URL
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+if os.path.exists(".env"):
+    load_dotenv()
+    logger.info("Loaded environment variables from .env file")
+
+# Get database URL
+DATABASE_URL = os.getenv('DATABASE_URL')
+logger.info(f"Using Database URL: {DATABASE_URL}")
 
 # Create database engine
-engine = create_engine(DATABASE_URL)
+try:
+    engine = create_engine(DATABASE_URL)
+    logger.info("Database engine created successfully")
+except Exception as e:
+    logger.error(f"Error creating database engine: {str(e)}")
+    raise
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -251,4 +271,38 @@ def get_task_by_id(task_id: int) -> Optional[dict]:
             'urgency': row[2],
             'status': row[3],
             'alertAt': row[4]
-        } 
+        }
+
+def get_all_tasks() -> List[dict]:
+    """
+    Retrieve all tasks from the database.
+    
+    Returns:
+        List[dict]: A list of all tasks as dictionaries
+    """
+    logger.info("Fetching all tasks from database")
+    session = SessionLocal()
+    try:
+        tasks = []
+        query = session.query(Task).order_by(Task.urgency.desc(), Task.alertAt.asc())
+        logger.info(f"Task query: {query}")
+        all_tasks = query.all()
+        logger.info(f"Found {len(all_tasks)} tasks")
+        
+        for task in all_tasks:
+            task_dict = {
+                'id': task.id,
+                'description': task.description,
+                'urgency': task.urgency,
+                'status': task.status,
+                'alertAt': task.alertAt,
+                'type': 'task'  # Add type to distinguish from other items
+            }
+            tasks.append(task_dict)
+            logger.info(f"Added task to list: {task_dict}")
+        return tasks
+    except Exception as e:
+        logger.error(f"Error fetching tasks: {str(e)}")
+        return []
+    finally:
+        session.close() 

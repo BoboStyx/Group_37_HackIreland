@@ -9,7 +9,7 @@ import re
 
 from chatgpt_agent import ChatGPTAgent
 from o3_mini import O3MiniAgent
-from database import SessionLocal, Conversation, AgentTask, Task, get_tasks_by_urgency, update_task_status, get_task_by_id, update_task_urgency, append_task_notes, create_task, update_task_description
+from database import SessionLocal, Conversation, AgentTask, Task, get_tasks_by_urgency, update_task_status, get_task_by_id, update_task_urgency, append_task_notes, create_task, update_task_description, get_all_tasks
 from config import (
     MAX_RETRIES, TIMEOUT, MAX_TOKENS, MAX_EMAILS,
     URGENCY_ORDER, HALF_FINISHED_PRIORITY
@@ -63,6 +63,14 @@ class AIAgent:
             raise RuntimeError("No AI models are available.")
 
         try:
+            # Get all tasks at the start
+            all_tasks = get_all_tasks()
+            if context is None:
+                context = {}
+            context['tasks'] = all_tasks
+            context['task_count'] = len(all_tasks)
+            context['has_tasks'] = len(all_tasks) > 0
+
             # Process input for profile insights first
             learned_something = False
             profile_insight = None
@@ -253,33 +261,13 @@ class AIAgent:
             logger.error(f"Error getting task count: {str(e)}")
             raise
 
-    async def get_tasks(self) -> List[dict]:
-        """
-        Retrieve all tasks and information items ordered by urgency.
-        
-        Returns:
-            List[dict]: List of all tasks and information items
-        """
+    async def get_tasks(self) -> List[Dict[str, Any]]:
+        """Get all tasks from the database."""
         try:
-            all_items = []
-            for urgency in URGENCY_ORDER:
-                items = get_tasks_by_urgency(urgency)
-                if items:  # Only extend if we got items
-                    # Filter out completed tasks
-                    active_items = [item for item in items if item.get('status') != 'completed']
-                    all_items.extend(active_items)
-
-                # Handle half-finished tasks with special priority
-                if urgency == HALF_FINISHED_PRIORITY:
-                    half_finished = [t for t in items if t.get('status') == 'half-completed']
-                    if half_finished:
-                        all_items.extend(half_finished)
-
-            return all_items
-
+            return get_all_tasks()
         except Exception as e:
-            logger.error(f"Error retrieving tasks: {str(e)}")
-            raise
+            logger.error(f"Error fetching tasks: {str(e)}")
+            return []
 
     def _chunk_tasks(self, tasks: List[dict]) -> List[List[dict]]:
         """
